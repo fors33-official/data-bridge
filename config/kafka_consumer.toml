@@ -1,0 +1,39 @@
+# Kafka Consumer Connector Configuration
+# This template connects to a Kafka cluster on the default port 9092
+# Set T3THR_KAFKA_SASL_PASSWORD environment variable for SASL authentication
+
+[connector.message_bus]
+provider = "kafka"
+bootstrap_servers = "localhost:9092"  # Default Kafka port
+topic = "data-stream"
+group_id = "data_bridge"
+# For SASL authentication, use env_client_properties
+[connector.message_bus.client_properties]
+"security.protocol" = "SASL_SSL"
+"sasl.mechanism" = "PLAIN"
+"sasl.username" = "replace_with_public_username_or_literal"
+[connector.message_bus.env_client_properties]
+"sasl.password" = "T3THR_KAFKA_SASL_PASSWORD"  # Set this environment variable
+
+[normalizer]
+field_count = 2
+# Adjust field_count based on your Kafka message structure
+
+[normalizer.field_map]
+"metric_0" = 0
+"metric_1" = 1
+
+[filter]
+reject_nan_inf = true
+replay_mode = false
+drop_on_parse_error = true
+fail_fast = true
+future_tolerance_ms = 60000
+stale_tolerance_ms = 300000
+
+[output]
+accepted_path = "out/kafka_accepted.csv"
+dead_letter_path = "out/kafka_dead.csv"
+
+[output.headers]
+headers = ["metric_0", "metric_1"]

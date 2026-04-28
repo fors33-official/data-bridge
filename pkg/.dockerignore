@@ -1,0 +1,8 @@
+target
+.git
+.cursor
+**/__pycache__
+**/.pytest_cache
+**/*.log
+reference
+

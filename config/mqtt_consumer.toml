@@ -1,0 +1,34 @@
+# MQTT Consumer Connector Configuration
+# This template connects to an MQTT broker on the default port 1883
+# Set T3THR_MQTT_PASSWORD environment variable for password authentication
+
+[connector.message_bus]
+provider = "mqtt"
+broker = "localhost:1883"  # Default MQTT port
+topic = "sensors/data"
+# For password authentication, use env_client_properties
+[connector.message_bus.env_client_properties]
+"password" = "T3THR_MQTT_PASSWORD"  # Set this environment variable
+
+[normalizer]
+field_count = 2
+# Adjust field_count based on your MQTT message structure
+
+[normalizer.field_map]
+"metric_0" = 0
+"metric_1" = 1
+
+[filter]
+reject_nan_inf = true
+replay_mode = false
+drop_on_parse_error = true
+fail_fast = true
+future_tolerance_ms = 60000
+stale_tolerance_ms = 300000
+
+[output]
+accepted_path = "out/mqtt_accepted.csv"
+dead_letter_path = "out/mqtt_dead.csv"
+
+[output.headers]
+headers = ["metric_0", "metric_1"]

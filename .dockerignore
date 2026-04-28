@@ -1,0 +1,52 @@
+# Prevent leaking secrets / internal material into Docker build context.
+# Keep context small and deterministic for CI and local builds.
+
+# Local packaging staging (never part of image context)
+/products/
+
+# Rust build artifacts
+/target/
+
+# Local outputs (never ship)
+/out/
+
+# Local scratch tests and experiments (never ship)
+.tmp-tests/
+
+# Internal-only reference material (never ship)
+/reference/
+
+# Internal documentation (entire folder is maintainer-only)
+/docs/
+
+# Config files not needed in build context - users mount at runtime
+/config/
+
+# Secrets / credentials
+.env
+**/env
+**/*.ini
+**/*.pem
+**/*.key
+**/.ssh/
+
+# Repo metadata / editor artifacts
+/.git/
+/.gitignore
+/.gitattributes
+/.cursor/
+.cursorignore
+/.vscode/
+
+# OS / misc
+.DS_Store
+Thumbs.db
+*.log
+
+# Python/Node leftovers (if present)
+**/__pycache__/
+**/*.pyc
+**/node_modules/
+**/.venv/
+**/.pytest_cache/
+

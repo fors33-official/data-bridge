@@ -1,0 +1,36 @@
+# MySQL CDC Connector Configuration
+# This template connects to MySQL using binlog replication with GTID support
+# Set T3THR_MYSQL_PASSWORD environment variable with your database password
+
+[connector.cdc]
+provider = "mysql"
+host = "localhost"
+port = 3306  # Default MySQL port
+database = "your_database"
+username = "your_username"
+password = null  # Use env_password instead for security
+env_password = "T3THR_MYSQL_PASSWORD"  # Set this environment variable
+gtid_mode = "server_executed"  # Default GTID mode
+
+[normalizer]
+field_count = 2
+# Adjust field_count based on your table structure
+
+[normalizer.field_map]
+"metric_0" = 0
+"metric_1" = 1
+
+[filter]
+reject_nan_inf = true
+replay_mode = false
+drop_on_parse_error = true
+fail_fast = true
+future_tolerance_ms = 60000
+stale_tolerance_ms = 300000
+
+[output]
+accepted_path = "out/mysql_cdc_accepted.csv"
+dead_letter_path = "out/mysql_cdc_dead.csv"
+
+[output.headers]
+headers = ["metric_0", "metric_1"]

@@ -1,0 +1,32 @@
+# Kraken WebSocket Connector Configuration
+# This template connects to Kraken's public WebSocket API v2
+# For private/authenticated feeds, use wss://ws-auth.kraken.com/v2
+
+[connector.websocket]
+url = "wss://ws.kraken.com/v2"
+provider = "kraken"
+# Kraken uses built-in parsing - field_paths not required
+# The engine automatically extracts price/volume from Kraken's message format
+
+[normalizer]
+field_count = 2
+# Kraken provides price and volume in standardized format
+
+[normalizer.field_map]
+"price" = 0
+"volume" = 1
+
+[filter]
+reject_nan_inf = true
+replay_mode = false
+drop_on_parse_error = true
+fail_fast = true
+future_tolerance_ms = 60000
+stale_tolerance_ms = 300000
+
+[output]
+accepted_path = "out/kraken_accepted.csv"
+dead_letter_path = "out/kraken_dead.csv"
+
+[output.headers]
+headers = ["price", "volume"]

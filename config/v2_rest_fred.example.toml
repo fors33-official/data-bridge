@@ -1,0 +1,40 @@
+# REST connector — FRED (Federal Reserve Economic Data) macro series.
+#
+# Uses the St. Louis Fed FRED API. Get a free API key at:
+# https://fred.stlouisfed.org/docs/api/api_key.html
+#
+# Replace YOUR_FRED_API_KEY with your key, or set FRED_API_KEY in env and
+# use a URL that references it (the bridge does not expand env vars in URL;
+# use a wrapper script or preprocess the config if needed).
+#
+# Response structure: observations array; we take the latest (limit=1, sort_order=desc).
+# Price proxy: observations.0.value (the macro series value)
+# Volume proxy: count (1 when limit=1; use as constant for single-point series)
+#
+# Example series: UNRATE (unemployment), GNPCA (real GNP), FEDFUNDS (Fed funds rate).
+
+[connector.rest]
+url = "https://api.stlouisfed.org/fred/series/observations?series_id=UNRATE&api_key=YOUR_FRED_API_KEY&file_type=json&limit=1&sort_order=desc"
+poll_interval_ms = 3600000
+# Latest observation value
+price_path = "observations.0.value"
+# count = 1 when limit=1; acts as constant volume proxy for macro series
+volume_path = "count"
+response_format = "json"
+
+[filter]
+reject_nan_inf = true
+price_min = 0.0
+price_max = 100.0
+volume_min = 0.0
+volume_max = 10000000.0
+volume_burst_max_ratio = 10000.0
+burst_ema_alpha = 0.05
+future_tolerance_ms = 5000
+stale_tolerance_ms = 86400000
+replay_mode = false
+drop_on_parse_error = true
+
+[output]
+accepted_path = "out/v2_rest_fred_accepted.csv"
+dead_letter_path = "out/v2_rest_fred_dead.csv"

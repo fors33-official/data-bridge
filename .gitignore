@@ -1,0 +1,44 @@
+# Local packaging staging and export (never commit or push)
+/products/
+
+# Build artifacts
+/target/
+**/__pycache__/
+
+# Secrets / credentials
+.env
+**/env
+**/*.ini
+**/*.pem
+!fors33_t3thr_license_public.pem
+**/*.key
+**/.ssh/
+
+# Local operator configs - exclude internal research configs
+/config/v1_*.toml
+/config/v3_*.toml
+/config/qcr.toml
+/config/v2_dce_*.toml
+/config/v2_binance_btc.toml
+/config/v2_kraken_live.toml
+/config/v2_binance_parquet.toml
+# Allow customer-facing templates and examples
+# default.toml, kraken_websocket.toml, binance_*.toml, alchemy_websocket.toml, etc.
+# v2_*_example.toml files are generic examples for customers
+
+# Local outputs (never commit)
+/out/
+
+# Internal-only reference material (must never ship public)
+/reference/
+
+# Internal documentation (entire folder is maintainer-only)
+/docs/
+
+# Cursor workspace (internal)
+/.cursor/
+.cursorignore
+
+# OS
+.DS_Store
+Thumbs.db

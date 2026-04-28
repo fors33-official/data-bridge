@@ -1,0 +1,31 @@
+# Example MQTT connector (unified message bus).
+# Payload: JSON with price_path/volume_path (dot notation).
+# Broker: host or host:port (default port 1883).
+
+[connector.message_bus]
+provider = "mqtt"
+broker = "localhost:1883"
+topic = "market/ticks"
+price_path = "price"
+volume_path = "volume"
+
+[normalizer]
+price_field = "price"
+volume_field = "volume"
+
+[filter]
+reject_nan_inf = true
+price_min = 0.0
+price_max = 1000000.0
+volume_min = 0.0
+volume_max = 10000000.0
+volume_burst_max_ratio = 10000.0
+burst_ema_alpha = 0.05
+future_tolerance_ms = 2000
+stale_tolerance_ms = 600000
+replay_mode = false
+drop_on_parse_error = true
+
+[output]
+accepted_path = "out/v2_mqtt_accepted.csv"
+dead_letter_path = "out/v2_mqtt_dead.csv"

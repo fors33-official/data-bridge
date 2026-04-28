@@ -1,0 +1,31 @@
+# Example Kafka consumer connector (unified message bus).
+# Messages: JSON with price_path/volume_path (dot notation).
+
+[connector.message_bus]
+provider = "kafka"
+bootstrap_servers = "localhost:9092"
+topic = "market-ticks"
+group_id = "aos2-bridge"
+price_path = "price"
+volume_path = "volume"
+
+[normalizer]
+price_field = "price"
+volume_field = "volume"
+
+[filter]
+reject_nan_inf = true
+price_min = 0.0
+price_max = 1000000.0
+volume_min = 0.0
+volume_max = 10000000.0
+volume_burst_max_ratio = 10000.0
+burst_ema_alpha = 0.05
+future_tolerance_ms = 2000
+stale_tolerance_ms = 600000
+replay_mode = false
+drop_on_parse_error = true
+
+[output]
+accepted_path = "out/v2_kafka_accepted.csv"
+dead_letter_path = "out/v2_kafka_dead.csv"

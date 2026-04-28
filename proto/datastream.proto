@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package datastream;
+
+/// Universal data streaming service for AOS2 Data Bridge.
+/// Implement this service to stream time-series data into the bridge via gRPC.
+service DataStream {
+  /// Stream data points. Server sends DataPoint messages until the stream is closed.
+  rpc StreamDataPoints(StreamRequest) returns (stream DataPoint);
+}
+
+message StreamRequest {}
+
+message DataPoint {
+  int64 timestamp_ns = 1;
+  repeated double metrics = 2;
+}

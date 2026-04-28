@@ -1,0 +1,42 @@
+# REST connector — Inventory/ERP profile.
+#
+# Use the existing REST connector for inventory, WMS, or ERP APIs that expose
+# stock levels, orders, or throughput via HTTP. Map domain-specific fields to
+# the canonical (price, volume) pair per Connector Consolidation Plan §3.2.
+#
+# Price proxy: unit_cost, stress metric, or configurable path.
+# Volume proxy: quantity, throughput, or configurable path.
+#
+# Example: API returns JSON like:
+#   { "unit_cost": 12.50, "quantity": 1500, "warehouse": "WH-A" }
+# or nested:
+#   { "data": { "cost_per_unit": 12.50, "in_stock": 1500 } }
+#
+# Set price_path and volume_path to match your API response structure.
+# Dot notation for nested fields (e.g. "data.cost_per_unit").
+
+[connector.rest]
+url = "https://api.example.com/inventory/levels"
+poll_interval_ms = 5000
+# Price proxy: unit cost, stress metric, or derived
+price_path = "unit_cost"
+# Volume proxy: quantity, throughput, or order count
+volume_path = "quantity"
+response_format = "json"
+
+[filter]
+reject_nan_inf = true
+price_min = 0.0
+price_max = 1e12
+volume_min = 0.0
+volume_max = 1e9
+volume_burst_max_ratio = 10000.0
+burst_ema_alpha = 0.05
+future_tolerance_ms = 5000
+stale_tolerance_ms = 600000
+replay_mode = false
+drop_on_parse_error = true
+
+[output]
+accepted_path = "out/v2_rest_inventory_accepted.csv"
+dead_letter_path = "out/v2_rest_inventory_dead.csv"

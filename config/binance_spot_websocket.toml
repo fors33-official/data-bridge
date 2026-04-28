@@ -1,0 +1,33 @@
+# Binance Spot WebSocket Connector Configuration
+# This template connects to Binance's public spot market WebSocket API
+# Replace btcusdt with your desired trading pair (e.g., ethusdt, solusdt)
+
+[connector.websocket]
+url = "wss://stream.binance.com:9443/ws/"
+provider = "binance"
+stream = "btcusdt@trade"  # Replace with your symbol@trade
+# Binance uses built-in parsing - field_paths not required
+# The engine automatically extracts price/volume from Binance's trade format
+
+[normalizer]
+field_count = 2
+# Binance provides price and volume in standardized trade format
+
+[normalizer.field_map]
+"price" = 0
+"volume" = 1
+
+[filter]
+reject_nan_inf = true
+replay_mode = false
+drop_on_parse_error = true
+fail_fast = true
+future_tolerance_ms = 60000
+stale_tolerance_ms = 300000
+
+[output]
+accepted_path = "out/binance_spot_accepted.csv"
+dead_letter_path = "out/binance_spot_dead.csv"
+
+[output.headers]
+headers = ["price", "volume"]

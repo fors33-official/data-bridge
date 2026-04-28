@@ -1,0 +1,33 @@
+# Alchemy Ethereum WebSocket Connector Configuration
+# This template connects to Alchemy's Ethereum mainnet WebSocket RPC
+# Set T3THR_ALCHEMY_KEY environment variable with your Alchemy API key
+
+[connector.websocket]
+url = "wss://eth-mainnet.g.alchemy.com/v2/${T3THR_ALCHEMY_KEY}"
+provider = "alchemy"
+# Set T3THR_ALCHEMY_KEY environment variable with your Alchemy API key
+# For custom Ethereum RPC providers, specify field_paths to extract metrics
+field_paths = ["result", "gasPrice"]  # Example: extract result and gasPrice from JSON-RPC response
+
+[normalizer]
+field_count = 2
+# Adjust field_count based on your field_paths
+
+[normalizer.field_map]
+"result" = 0
+"gasPrice" = 1
+
+[filter]
+reject_nan_inf = true
+replay_mode = false
+drop_on_parse_error = true
+fail_fast = true
+future_tolerance_ms = 60000
+stale_tolerance_ms = 300000
+
+[output]
+accepted_path = "out/alchemy_accepted.csv"
+dead_letter_path = "out/alchemy_dead.csv"
+
+[output.headers]
+headers = ["result", "gasPrice"]

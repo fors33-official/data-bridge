@@ -1,0 +1,61 @@
+[package]
+name = "t3thr"
+version = "0.4.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["std"], default-features = false }
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+hex = "0.4"
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+reqwest = { version = "0.11", features = ["json", "blocking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+walkdir = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+
+# full_engine: Kafka/MQTT, WebSocket, gRPC, Parquet input, CDC connectors
+arrow2 = { version = "0.18", features = ["io_parquet", "io_parquet_compression"], optional = true }
+futures-util = { version = "0.3", optional = true }
+rdkafka = { version = "0.36", features = ["cmake-build"], optional = true }
+rumqttc = { version = "0.25", optional = true }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"], optional = true }
+tonic = { version = "0.14", optional = true }
+tonic-prost = { version = "0.14", optional = true }
+prost = { version = "0.14", optional = true }
+tokio-postgres = { version = "0.7", optional = true }
+mysql_async = { version = "0.34", optional = true }
+
+[build-dependencies]
+protoc-bin-vendored = { version = "3", optional = true }
+tonic-prost-build = { version = "0.14", optional = true }
+
+[features]
+default = ["slim_engine"]
+# Lightweight public binary: file, CSV, REST; license gate for live REST.
+slim_engine = []
+# Dev-only: bypass live-connector license gate for local validation. Never for release builds.
+dev_license_bypass = []
+# Docker / full product: all connectors + Parquet + gRPC protos.
+full_engine = [
+    "dep:arrow2",
+    "dep:futures-util",
+    "dep:rdkafka",
+    "dep:rumqttc",
+    "dep:tokio-tungstenite",
+    "dep:tonic",
+    "dep:tonic-prost",
+    "dep:prost",
+    "dep:protoc-bin-vendored",
+    "dep:tonic-prost-build",
+    "dep:tokio-postgres",
+    "dep:mysql_async",
+]
+
+[profile.release]
+strip = true
+lto = true
