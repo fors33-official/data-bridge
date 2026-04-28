@@ -11,11 +11,6 @@ on:
         required: false
         default: true
         type: boolean
-      tag_main:
-        description: 'Tag as main'
-        required: false
-        default: true
-        type: boolean
 
 jobs:
   build-and-publish:
@@ -50,7 +45,5 @@ jobs:
           tags: |
             fors33/data-bridge:${{ inputs.version }}
             ${{ inputs.tag_latest && 'fors33/data-bridge:latest' || '' }}
-            ${{ inputs.tag_main && 'fors33/data-bridge:main' || '' }}
             ghcr.io/fors33-official/data-bridge:${{ inputs.version }}
             ${{ inputs.tag_latest && 'ghcr.io/fors33-official/data-bridge:latest' || '' }}
-            ${{ inputs.tag_main && 'ghcr.io/fors33-official/data-bridge:main' || '' }}
