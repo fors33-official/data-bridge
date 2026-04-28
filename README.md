@@ -1,12 +1,31 @@
 # Fors33 T3thr
 
-![Version](https://img.shields.io/github/v/release/fors33-official/data-bridge?style=flat-square&color=black)
-![Docker Pulls](https://img.shields.io/docker/pulls/fors33/data-bridge?style=flat-square&color=black)
-![License](https://img.shields.io/github/license/fors33-official/data-bridge?style=flat-square&color=black)
-![Build Status](https://img.shields.io/github/actions/workflow/status/fors33-official/data-bridge/release.yml?style=flat-square&color=black)
-![GHCR Version](https://img.shields.io/github/v/release/fors33-official/data-bridge?label=GHCR&style=flat-square&color=black)
+[![CI](https://img.shields.io/github/actions/workflow/status/fors33-official/data-bridge/release.yml?branch=main&style=flat-square)](https://github.com/fors33-official/data-bridge/actions)
+[![Release](https://img.shields.io/badge/release-0.4.0-blue?style=flat-square)](https://github.com/fors33-official/data-bridge/releases)
+[![Docker Tag](https://img.shields.io/badge/docker-0.4.0%20%7C%20latest-2496ED?style=flat-square&logo=docker&logoColor=white)](https://hub.docker.com/r/fors33/data-bridge)
+[![Docker Pulls](https://img.shields.io/docker/pulls/fors33/data-bridge?style=flat-square)](https://hub.docker.com/r/fors33/data-bridge)
+[![License](https://img.shields.io/github/license/fors33-official/data-bridge?style=flat-square)](https://github.com/fors33-official/data-bridge/blob/main/LICENSE)
 
 T3thr is a config-driven tool for processing time-series data from **local files** (free tier) or **live connectors** (subscription-gated), producing clean outputs for downstream analysis.
+
+## v0.4.0 Release (April 28, 2026)
+
+**Major Features:**
+- **Frictionless Configuration** - 10 pre-built connector templates with provider-specific defaults
+- **Config Wizard** - Interactive setup with provider selection and pre-filled endpoints
+- **GitHub Migration** - Public repository with manual GitHub Actions workflow
+- **Dual Registry Support** - Docker Hub and GitHub Container Registry (GHCR)
+
+**New Connectors:**
+- WebSocket providers: Kraken, Binance (spot/futures), Alchemy, Infura
+- CDC connectors: PostgreSQL (5432), MySQL (3306)
+- Infrastructure: Syslog (514), Kafka (9092), MQTT (1883), gRPC (50051)
+
+**Security & Architecture:**
+- Local security scrub before push (manual audit)
+- Single-architecture linux/amd64 Docker builds
+- Environment variable patterns for secrets (T3THR_*)
+- Comprehensive .gitignore and .dockerignore for public repo
 
 ## Limitation of Liability
 
