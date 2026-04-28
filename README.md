@@ -8,25 +8,6 @@
 
 T3thr is a config-driven tool for processing time-series data from **local files** (free tier) or **live connectors** (subscription-gated), producing clean outputs for downstream analysis.
 
-## v0.4.0 Release (April 28, 2026)
-
-**Major Features:**
-- **Frictionless Configuration** - 10 pre-built connector templates with provider-specific defaults
-- **Config Wizard** - Interactive setup with provider selection and pre-filled endpoints
-- **GitHub Migration** - Public repository with manual GitHub Actions workflow
-- **Dual Registry Support** - Docker Hub and GitHub Container Registry (GHCR)
-
-**New Connectors:**
-- WebSocket providers: Kraken, Binance (spot/futures), Alchemy, Infura
-- CDC connectors: PostgreSQL (5432), MySQL (3306)
-- Infrastructure: Syslog (514), Kafka (9092), MQTT (1883), gRPC (50051)
-
-**Security & Architecture:**
-- Local security scrub before push (manual audit)
-- Single-architecture linux/amd64 Docker builds
-- Environment variable patterns for secrets (T3THR_*)
-- Comprehensive .gitignore and .dockerignore for public repo
-
 ## Limitation of Liability
 
 T3thr is a deterministic ingestion engine provided "AS IS". Fors33 is not liable for data dropped due to network latency, third-party API rate limits, or improper local hardware configuration. The operator assumes all responsibility for regulatory compliance, data retention, and hardware provisioning. For the full EULA, see `fors33.com/products/t3thr`.
@@ -98,20 +79,29 @@ docker run --rm \
 
 **Frictionless Configuration:** Zero-configuration setup for standard providers. The config wizard now auto-generates complete configs for Kraken, Binance, Alchemy, Infura, PostgreSQL, MySQL, and more with pre-filled endpoints and ports.
 
+**Config Wizard:** Interactive setup with provider selection and pre-filled endpoints. Run `t3thr --config-wizard` to generate complete configs automatically.
+
 **Pre-configured Templates:** 10 ready-to-use templates in `config/` directory:
 - WebSocket: Kraken, Binance (Spot/Futures), Alchemy, Infura
 - CDC: PostgreSQL (port 5432), MySQL (port 3306)
 - Infrastructure: Syslog (port 514), Kafka (port 9092), MQTT (port 1883), gRPC (port 50051)
 
-**Additional connectors:** syslog (RFC 5424/3164), UDP JSON datagrams, CDC (Postgres/MySQL).
+**New Connectors:** Full support for syslog (RFC 5424/3164), UDP JSON datagrams, CDC (Postgres/MySQL), Message Bus (Kafka/MQTT), and gRPC.
 
-**Batch processing mode:** Process historical data and exit on completion. Enable with `mode = "batch"` in file or REST connectors.
+**Batch Processing Mode:** Process historical data and exit on completion. Enable with `mode = "batch"` in file or REST connectors.
 
-**State tracking:** Resume interrupted batch jobs from last position using `.t3thr-state.json`.
+**State Tracking:** Resume interrupted batch jobs from last position using `.t3thr-state.json`.
 
-**CLI flags:**
+**Enhanced CLI Flags:**
+- `--config-wizard` - Interactive configuration setup
 - `--reset-state` - Delete state file for fresh start
 - `--no-state` - Disable state tracking
+
+**GitHub Migration:** Public repository with manual GitHub Actions workflow for releases.
+
+**Dual Registry Support:** Available on Docker Hub (`fors33/data-bridge`) and GitHub Container Registry (`ghcr.io/fors33-official/data-bridge`).
+
+**Environment Variable Patterns:** Secure secret management with `T3THR_*` prefix for all connector secrets.
 
 ### 0.3.0: secrets in the environment, not on disk
 
