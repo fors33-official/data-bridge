@@ -40,5 +40,7 @@ jobs:
           tags: |
             fors33/data-bridge:${{ inputs.version }}
             fors33/data-bridge:latest
+            fors33/data-bridge:main
             ghcr.io/fors33-official/data-bridge:${{ inputs.version }}
             ghcr.io/fors33-official/data-bridge:latest
+            ghcr.io/fors33-official/data-bridge:main
