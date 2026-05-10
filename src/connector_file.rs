@@ -4,10 +4,9 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+use walkdir::WalkDir;
 
-use anyhow::{anyhow, Context, Result};
-
-use crate::Cli;
+use anyhow::{Context, Result, anyhow};
 #[cfg(feature = "full_engine")]
 use arrow2::array::Array;
 #[cfg(feature = "full_engine")]
@@ -17,23 +16,56 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    ensure_parent, parse_datetime_to_ns, parse_ts_to_ns, now_unix_ms, BridgeConfig, DataPoint,
-    FilterState, NormalizerCfg,
+    BridgeConfig, DataPoint, FilterState, NormalizerCfg, ensure_parent, now_unix_ms,
+    parse_datetime_to_ns, parse_ts_to_ns,
 };
 
 const MAX_JSONL_LINE_BYTES: usize = 5_242_880; // 5 MiB
 
-fn write_deadletter_jsonl(cfg: &BridgeConfig, dead: &mut File, reason: &str, raw_record: &str) -> Result<()> {
-    let now_ns = now_unix_ms() * 1_000_000;
+// Cooperative OS yield cadence for tight per-record loops. spawn_blocking /
+// block_in_place at the engine entrypoint already isolates this work from any
+// shared tokio runtime; std::thread::yield_now() here only adds OS-level
+// fairness so a 2-core Docker Desktop VM does not starve sibling processes
+// (UI bridge, daemon supervisor) under sustained batch load.
+const YIELD_RECORDS: usize = 4096;
+
+fn write_deadletter_jsonl_at(
+    cfg: &BridgeConfig,
+    dead: &mut File,
+    reason: &str,
+    raw_record: &str,
+    timestamp_ns: u64,
+) -> Result<()> {
+    // Deterministic payload for SEC/non-finite evidence.
+    if reason == "Non-finite metric detected" {
+        let raw_json = serde_json::to_string(raw_record)?;
+        write!(
+            &mut *dead,
+            "{{\"timestamp_ns\":{},\"reason\":\"Non-finite metric detected\",\"raw_record\":{}}}\n",
+            timestamp_ns, raw_json
+        )?;
+        return Ok(());
+    }
+
     let shaped = cfg.output.shape_deadletter_raw_record(raw_record);
     let obj = serde_json::json!({
-        "timestamp_ns": now_ns,
+        "timestamp_ns": timestamp_ns,
         "reason": reason,
         "raw_record": shaped,
     });
     serde_json::to_writer(&mut *dead, &obj)?;
     dead.write_all(b"\n")?;
     Ok(())
+}
+
+fn write_deadletter_jsonl(
+    cfg: &BridgeConfig,
+    dead: &mut File,
+    reason: &str,
+    raw_record: &str,
+) -> Result<()> {
+    let now_ns = now_unix_ms() * 1_000_000;
+    write_deadletter_jsonl_at(cfg, dead, reason, raw_record, now_ns)
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,8 +75,8 @@ pub struct FileCfg {
     pub format: String, // csv | tsv | json | jsonl | parquet
     #[serde(default = "default_true")]
     pub has_headers: bool,
-    #[serde(default)]
-    pub mode: Option<String>, // "stream" | "batch" (default: "stream")
+    #[serde(default = "default_mode")]
+    pub mode: Option<String>, // "stream" (default) or "batch"
 }
 
 fn default_format() -> String {
@@ -53,6 +85,174 @@ fn default_format() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_mode() -> Option<String> {
+    Some("batch".to_string())
+}
+
+/// Batch mode: recursively walk directory and process all files with zero-copy streaming.
+/// Processes files one at a time to respect memory limits.
+fn batch_walk_and_copy(
+    file_cfg: &FileCfg,
+    cfg: &BridgeConfig,
+    state_path: Option<&std::path::Path>,
+) -> Result<()> {
+    let input_path = Path::new(&file_cfg.input_path);
+    let accepted_path = Path::new(&cfg.output.accepted_path);
+    let dead_path = Path::new(&cfg.output.dead_letter_path);
+
+    ensure_parent(accepted_path)?;
+    ensure_parent(dead_path)?;
+
+    // Load state for resume capability
+    let mut last_processed_file_path: Option<String> = None;
+    if let Some(path) = state_path {
+        match crate::utils::load_state(path) {
+            Ok(Some(state)) => {
+                if state.status == "in_progress" {
+                    last_processed_file_path = state.last_processed_file_path;
+                    eprintln!(
+                        "[Fors33] Resuming from previous run (last file: {:?})",
+                        last_processed_file_path
+                    );
+                }
+            }
+            Ok(None) => {
+                // No state file, start fresh
+            }
+            Err(e) => {
+                eprintln!(
+                    "[WARNING] State file corrupted: {}. Starting batch extraction from zero.",
+                    e
+                );
+            }
+        }
+    }
+
+    eprintln!(
+        "[Fors33] Batch mode: walking directory {}",
+        input_path.display()
+    );
+    println!("t3thr_metrics accepted=0 dropped=0 status=BATCH_START");
+
+    let mut processed_count = 0;
+    let mut error_count = 0;
+
+    // Walk directory recursively with lexicographical sort
+    let mut entries: Vec<_> = WalkDir::new(input_path)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .collect();
+
+    // Sort lexicographically for O(1) cursor-based resume
+    entries.sort_by(|a, b| a.path().cmp(b.path()));
+
+    for entry in entries {
+        if entry.file_type().is_file() {
+            let file_path = entry.path();
+            let file_path_str = file_path.to_string_lossy().to_string();
+
+            // Skip files that have already been processed (lexicographical comparison)
+            if let Some(ref last) = last_processed_file_path {
+                if file_path_str <= *last {
+                    eprintln!(
+                        "[Fors33] Skipping already processed: {}",
+                        file_path.display()
+                    );
+                    continue;
+                }
+            }
+
+            let format = resolve_format_from_path(file_path);
+
+            eprintln!(
+                "[Fors33] Processing file: {} (format: {})",
+                file_path.display(),
+                format
+            );
+
+            let result = match format {
+                "csv" | "tsv" => {
+                    run_csv_tsv(file_cfg, cfg, format, file_path, accepted_path, dead_path)
+                }
+                "json" => run_json(file_cfg, cfg, file_path, accepted_path, dead_path),
+                "jsonl" => run_jsonl(file_cfg, cfg, file_path, accepted_path, dead_path),
+                "parquet" => run_parquet(file_cfg, cfg, file_path, accepted_path, dead_path),
+                other => {
+                    eprintln!("[Fors33] Skipping unsupported format: {}", other);
+                    continue;
+                }
+            };
+
+            match result {
+                Ok(_) => {
+                    processed_count += 1;
+                    eprintln!("[Fors33] Successfully processed: {}", file_path.display());
+
+                    // Update state after each successful file
+                    if let Some(path) = state_path {
+                        let state = crate::utils::State {
+                            version: 1,
+                            connector_type: "file".to_string(),
+                            status: "in_progress".to_string(),
+                            last_processed_file_path: Some(file_path_str.clone()),
+                            cursor: None,
+                        };
+                        if let Err(e) = crate::utils::save_state(path, &state) {
+                            eprintln!("[WARNING] Failed to save state: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error_count += 1;
+                    eprintln!("[Fors33] Error processing {}: {}", file_path.display(), e);
+                }
+            }
+        }
+    }
+
+    // Set status to completed on success
+    if let Some(path) = state_path {
+        let state = crate::utils::State {
+            version: 1,
+            connector_type: "file".to_string(),
+            status: "completed".to_string(),
+            last_processed_file_path,
+            cursor: None,
+        };
+        if let Err(e) = crate::utils::save_state(path, &state) {
+            eprintln!("[WARNING] Failed to save completion state: {}", e);
+        }
+    }
+
+    eprintln!(
+        "[Fors33] Batch mode complete: {} files processed, {} errors",
+        processed_count, error_count
+    );
+    println!(
+        "t3thr_metrics accepted={} dropped={} status=BATCH_COMPLETE",
+        processed_count, error_count
+    );
+
+    if error_count > 0 {
+        Err(anyhow!("Batch mode completed with {} errors", error_count))
+    } else {
+        Ok(())
+    }
+}
+
+/// Resolve format from file path (used in batch mode for individual files).
+fn resolve_format_from_path(path: &Path) -> &str {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("parquet") => "parquet",
+        Some("json") => "json",
+        Some("jsonl") | Some("ndjson") => "jsonl",
+        Some("tsv") => "tsv",
+        Some("csv") => "csv",
+        _ => "csv", // Default to CSV
+    }
 }
 
 /// Resolve format from config or file extension.
@@ -71,12 +271,17 @@ pub(crate) fn resolve_format(cfg: &FileCfg) -> &str {
 }
 
 /// Run universal file connector.
-pub fn run_file_mode(cfg: &BridgeConfig, cli: &Cli) -> Result<()> {
+pub fn run_file_mode(cfg: &BridgeConfig, state_path: Option<&std::path::Path>) -> Result<()> {
     let file_cfg = cfg
         .connector
         .file
         .as_ref()
         .ok_or_else(|| anyhow!("connector.file required for file mode"))?;
+
+    // Check if batch mode is enabled
+    if file_cfg.mode.as_deref() == Some("batch") {
+        return batch_walk_and_copy(file_cfg, cfg, state_path);
+    }
 
     let format = resolve_format(file_cfg);
     let input_path = Path::new(&file_cfg.input_path);
@@ -86,61 +291,16 @@ pub fn run_file_mode(cfg: &BridgeConfig, cli: &Cli) -> Result<()> {
     ensure_parent(accepted_path)?;
     ensure_parent(dead_path)?;
 
-    // Check batch mode
-    let is_batch = file_cfg.mode.as_deref() == Some("batch");
+    // One-shot lifecycle marker for the daemon supervisor.
+    println!("t3thr_metrics accepted=0 dropped=0 status=FILE_START");
 
-    // Handle state tracking for batch mode
-    let state = if is_batch && !cli.no_state {
-        let output_dir = accepted_path.parent().unwrap_or(accepted_path);
-        let state_path = crate::utils::state_file_path(output_dir);
-
-        if cli.reset_state {
-            crate::utils::delete_state(&state_path)?;
-            eprintln!("[Fors33] State file deleted: {}", state_path.display());
-            None
-        } else {
-            let loaded = crate::utils::load_state(&state_path)?;
-            if let Some(ref s) = loaded {
-                if let Some(ref path) = s.last_processed_file_path {
-                    eprintln!("[Fors33] Resuming from state: file={}", path);
-                }
-            }
-            loaded
-        }
-    } else {
-        None
-    };
-
-    let result = match format {
-        "csv" | "tsv" => run_csv_tsv(file_cfg, cfg, format, input_path, accepted_path, dead_path, state.as_ref()),
-        "json" => run_json(file_cfg, cfg, input_path, accepted_path, dead_path, state.as_ref()),
-        "jsonl" => run_jsonl(file_cfg, cfg, input_path, accepted_path, dead_path, state.as_ref()),
-        "parquet" => {
-            #[cfg(feature = "full_engine")]
-            {
-                run_parquet(file_cfg, cfg, input_path, accepted_path, dead_path, state.as_ref())
-            }
-            #[cfg(not(feature = "full_engine"))]
-            {
-                Err(anyhow!(
-                    "connector.file format parquet requires t3thr built with --features full_engine"
-                ))
-            }
-        }
+    match format {
+        "csv" | "tsv" => run_csv_tsv(file_cfg, cfg, format, input_path, accepted_path, dead_path),
+        "json" => run_json(file_cfg, cfg, input_path, accepted_path, dead_path),
+        "jsonl" => run_jsonl(file_cfg, cfg, input_path, accepted_path, dead_path),
+        "parquet" => run_parquet(file_cfg, cfg, input_path, accepted_path, dead_path),
         other => Err(anyhow!("unsupported file format: {}", other)),
-    };
-
-    // Save state on successful completion in batch mode
-    if is_batch && result.is_ok() && !cli.no_state {
-        if let Some(ref s) = state {
-            let output_dir = accepted_path.parent().unwrap_or(accepted_path);
-            let state_path = crate::utils::state_file_path(output_dir);
-            crate::utils::save_state(&state_path, s)?;
-            eprintln!("[Fors33] State saved: {}", state_path.display());
-        }
     }
-
-    result
 }
 
 fn run_csv_tsv(
@@ -150,7 +310,6 @@ fn run_csv_tsv(
     input_path: &Path,
     accepted_path: &Path,
     dead_path: &Path,
-    _state: Option<&crate::utils::State>,
 ) -> Result<()> {
     let delimiter = if format == "tsv" { b'\t' } else { b',' };
     let mut reader = ReaderBuilder::new()
@@ -159,10 +318,7 @@ fn run_csv_tsv(
         .from_path(input_path)
         .with_context(|| format!("failed opening input {}", input_path.display()))?;
 
-    let headers = reader
-        .headers()
-        .context("failed reading headers")?
-        .clone();
+    let headers = reader.headers().context("failed reading headers")?.clone();
 
     process_tick_stream(
         cfg,
@@ -181,8 +337,9 @@ fn parse_csv_record(
     ncfg: &NormalizerCfg,
 ) -> Result<DataPoint> {
     let field_count = ncfg.get_field_count();
-    let field_map = ncfg.field_map.as_ref()
-        .ok_or_else(|| anyhow!("field_map required (use normalize_and_validate for legacy configs)"))?;
+    let field_map = ncfg.field_map.as_ref().ok_or_else(|| {
+        anyhow!("field_map required (use normalize_and_validate for legacy configs)")
+    })?;
     if field_count == 0 {
         return Err(anyhow!("field_count required"));
     }
@@ -211,7 +368,11 @@ fn parse_csv_record(
     let mut metrics = vec![0.0; field_count];
     for (source_field, &index) in field_map.iter() {
         if index >= field_count {
-            return Err(anyhow!("field_map index {} exceeds field_count {}", index, field_count));
+            return Err(anyhow!(
+                "field_map index {} exceeds field_count {}",
+                index,
+                field_count
+            ));
         }
         let fidx = headers
             .iter()
@@ -225,7 +386,10 @@ fn parse_csv_record(
         metrics[index] = value;
     }
 
-    Ok(DataPoint { timestamp_ns, metrics })
+    Ok(DataPoint {
+        timestamp_ns,
+        metrics,
+    })
 }
 
 fn json_get_value<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
@@ -264,7 +428,9 @@ fn parse_json_record(obj: &Value, ncfg: &NormalizerCfg) -> Result<DataPoint> {
     })?;
 
     let timestamp_ns = if let Some(ts_field) = &ncfg.timestamp_field {
-        if let (Some(fmt), Some(Value::String(s))) = (&ncfg.timestamp_format, json_get_value(obj, ts_field)) {
+        if let (Some(fmt), Some(Value::String(s))) =
+            (&ncfg.timestamp_format, json_get_value(obj, ts_field))
+        {
             parse_datetime_to_ns(s, fmt, ncfg.timestamp_date_override.as_deref())?
         } else if let Some(n) = json_get_f64(obj, ts_field) {
             let unit = ncfg.timestamp_unit.as_deref().unwrap_or("ms");
@@ -293,7 +459,10 @@ fn parse_json_record(obj: &Value, ncfg: &NormalizerCfg) -> Result<DataPoint> {
         metrics[index] = value;
     }
 
-    Ok(DataPoint { timestamp_ns, metrics })
+    Ok(DataPoint {
+        timestamp_ns,
+        metrics,
+    })
 }
 
 fn run_json(
@@ -302,7 +471,6 @@ fn run_json(
     input_path: &Path,
     accepted_path: &Path,
     dead_path: &Path,
-    _state: Option<&crate::utils::State>,
 ) -> Result<()> {
     // Decide parsing strategy with minimal buffering:
     // - Root arrays are streamed.
@@ -373,7 +541,9 @@ fn run_json_in_memory(
                     return run_json_values(cfg, arr.clone().into_iter(), accepted_path, dead_path);
                 }
             }
-            Err(anyhow!("JSON object must have 'rows', 'data', or 'records' array"))
+            Err(anyhow!(
+                "JSON object must have 'rows', 'data', or 'records' array"
+            ))
         }
         _ => Err(anyhow!("JSON root must be array or object with rows array")),
     }
@@ -450,7 +620,7 @@ where
             Err(reason) => {
                 dropped += 1;
                 let raw = serde_json::to_string(&obj).unwrap_or_else(|_| format!("row_{}", i));
-                write_deadletter_jsonl(cfg, &mut dead_file, &reason, &raw)?;
+                write_deadletter_jsonl_at(cfg, &mut dead_file, &reason, &raw, tick.timestamp_ns)?;
             }
         }
     }
@@ -459,6 +629,11 @@ where
     dead_file.flush()?;
     println!(
         "t3thr file (json) done | accepted={} dropped={}",
+        accepted, dropped
+    );
+
+    println!(
+        "t3thr_metrics accepted={} dropped={} status=FILE_EOF",
         accepted, dropped
     );
     Ok(())
@@ -522,7 +697,7 @@ where
             Err(reason) => {
                 dropped += 1;
                 let raw = serde_json::to_string(&obj).unwrap_or_else(|_| format!("row_{}", i));
-                write_deadletter_jsonl(cfg, &mut dead_file, &reason, &raw)?;
+                write_deadletter_jsonl_at(cfg, &mut dead_file, &reason, &raw, tick.timestamp_ns)?;
             }
         }
     }
@@ -531,6 +706,11 @@ where
     dead_file.flush()?;
     println!(
         "t3thr file (json) done | accepted={} dropped={}",
+        accepted, dropped
+    );
+
+    println!(
+        "t3thr_metrics accepted={} dropped={} status=FILE_EOF",
         accepted, dropped
     );
     Ok(())
@@ -542,7 +722,6 @@ fn run_jsonl(
     input_path: &Path,
     accepted_path: &Path,
     dead_path: &Path,
-    _state: Option<&crate::utils::State>,
 ) -> Result<()> {
     let f = File::open(input_path)
         .with_context(|| format!("failed opening {}", input_path.display()))?;
@@ -567,6 +746,9 @@ fn run_jsonl(
     let mut buf: Vec<u8> = Vec::new();
     let mut i: usize = 0;
     loop {
+        if i != 0 && i % YIELD_RECORDS == 0 {
+            std::thread::yield_now();
+        }
         buf.clear();
         let mut total: usize = 0;
         let mut capped = false;
@@ -693,7 +875,7 @@ fn run_jsonl(
             }
             Err(reason) => {
                 dropped += 1;
-                write_deadletter_jsonl(cfg, &mut dead_file, &reason, &line)?;
+                write_deadletter_jsonl_at(cfg, &mut dead_file, &reason, &line, tick.timestamp_ns)?;
             }
         }
         i += 1;
@@ -705,7 +887,23 @@ fn run_jsonl(
         "t3thr file (jsonl) done | accepted={} dropped={}",
         accepted, dropped
     );
+
+    println!(
+        "t3thr_metrics accepted={} dropped={} status=FILE_EOF",
+        accepted, dropped
+    );
     Ok(())
+}
+
+#[cfg(not(feature = "full_engine"))]
+fn run_parquet(
+    _file_cfg: &FileCfg,
+    _cfg: &BridgeConfig,
+    _input_path: &Path,
+    _accepted_path: &Path,
+    _dead_path: &Path,
+) -> Result<()> {
+    Err(anyhow!("parquet connector requires full_engine feature"))
 }
 
 #[cfg(feature = "full_engine")]
@@ -715,7 +913,6 @@ fn run_parquet(
     input_path: &Path,
     accepted_path: &Path,
     dead_path: &Path,
-    _state: Option<&crate::utils::State>,
 ) -> Result<()> {
     let mut file = File::open(input_path)
         .with_context(|| format!("failed opening parquet {}", input_path.display()))?;
@@ -734,114 +931,170 @@ fn run_parquet(
     );
 
     let field_count = cfg.normalizer.get_field_count();
-    let field_map = cfg.normalizer.field_map.as_ref()
-        .ok_or_else(|| anyhow!("field_map required for parquet (normalizer.field_map)"))?;
-    if field_map.len() != field_count {
-        return Err(anyhow!(
-            "field_map size {} does not match field_count {}",
-            field_map.len(),
-            field_count
-        ));
-    }
+    let field_map = cfg.normalizer.field_map.as_ref();
+    let use_explicit_mapping = field_count > 0 && field_map.is_some();
 
-    let mut accepted_writer = WriterBuilder::new()
-        .from_path(accepted_path)
-        .with_context(|| format!("failed opening accepted output"))?;
-    let headers = cfg.output.get_headers(field_count);
-    accepted_writer.write_record(headers.iter().map(String::as_str))?;
-
-    let mut dead_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dead_path)
-        .with_context(|| format!("failed opening dead-letter output"))?;
-
-    let mut state = FilterState::with_capacity(field_count);
     let mut accepted = 0usize;
     let mut dropped = 0usize;
-    let mut row_offset = 0usize;
 
-    let ncfg = &cfg.normalizer;
-    let ts_field = ncfg.timestamp_field.as_deref();
-
-    for maybe_chunk in chunks {
-        let chunk = maybe_chunk.context("read parquet chunk")?;
-        let names: Vec<String> = chunk
-            .arrays()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, _)| schema.fields.get(i).map(|f| f.name.clone()))
-            .collect();
-
-        let mut metric_indices: Vec<usize> = vec![0; field_count];
-        for (source_field, &index) in field_map.iter() {
-            if index >= field_count {
-                return Err(anyhow!("field_map index {} exceeds field_count {}", index, field_count));
-            }
-            let col_idx = names
+    if !use_explicit_mapping {
+        // Frictionless parquet mode: self-describing schema, emit raw rows as JSONL
+        // when no explicit mapping is supplied by the daemon/UI.
+        let mut accepted_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(accepted_path)
+            .with_context(|| format!("failed opening accepted output"))?;
+        for maybe_chunk in chunks {
+            let chunk = maybe_chunk.context("read parquet chunk")?;
+            let names: Vec<String> = chunk
+                .arrays()
                 .iter()
-                .position(|n| n == source_field)
-                .ok_or_else(|| anyhow!("parquet missing column: {}", source_field))?;
-            metric_indices[index] = col_idx;
-        }
-        let ts_idx = ts_field.and_then(|f| names.iter().position(|n| n == f));
-        let ts_arr = ts_idx.map(|i| chunk.arrays()[i].as_ref());
-
-        let len = chunk.arrays()[0].len();
-        for row in 0..len {
-            let mut metrics = vec![0.0; field_count];
-            for (idx, &col_idx) in metric_indices.iter().enumerate() {
-                metrics[idx] = extract_f64(chunk.arrays()[col_idx].as_ref(), row)?;
-            }
-
-            let timestamp_ns = if let (Some(ts_arr), Some(fmt)) = (ts_arr, &ncfg.timestamp_format) {
-                let ts_str = extract_str(ts_arr, row).unwrap_or_default();
-                parse_datetime_to_ns(
-                    &ts_str,
-                    fmt,
-                    ncfg.timestamp_date_override.as_deref(),
-                )?
-            } else if let Some(ts_arr) = ts_arr {
-                if let Ok(n) = extract_f64(ts_arr, row) {
-                    let unit = ncfg.timestamp_unit.as_deref().unwrap_or("ms");
-                    parse_ts_to_ns(&format!("{}", n), unit, ncfg.timestamp_tick_hz)?
-                } else {
-                    now_unix_ms() * 1_000_000
+                .enumerate()
+                .filter_map(|(i, _)| schema.fields.get(i).map(|f| f.name.clone()))
+                .collect();
+            let len = chunk.arrays()[0].len();
+            for row in 0..len {
+                if accepted != 0 && accepted % YIELD_RECORDS == 0 {
+                    std::thread::yield_now();
                 }
-            } else {
-                now_unix_ms() * 1_000_000
-            };
+                let mut obj = serde_json::Map::new();
+                for (col_idx, name) in names.iter().enumerate() {
+                    let v = extract_json_value(chunk.arrays()[col_idx].as_ref(), row);
+                    obj.insert(name.clone(), v);
+                }
+                serde_json::to_writer(&mut accepted_file, &Value::Object(obj))?;
+                accepted_file.write_all(b"\n")?;
+                accepted += 1;
+            }
+        }
+        accepted_file.flush()?;
+    } else {
+        let field_map = field_map.expect("field_map present when explicit mapping enabled");
+        if field_map.len() != field_count {
+            return Err(anyhow!(
+                "field_map size {} does not match field_count {}",
+                field_map.len(),
+                field_count
+            ));
+        }
+        let mut accepted_writer = WriterBuilder::new()
+            .from_path(accepted_path)
+            .with_context(|| format!("failed opening accepted output"))?;
+        let headers = cfg.output.get_headers(field_count);
+        accepted_writer.write_record(headers.iter().map(String::as_str))?;
 
-            let point = DataPoint { timestamp_ns, metrics };
+        let mut dead_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dead_path)
+            .with_context(|| format!("failed opening dead-letter output"))?;
 
-            let raw_record = format!("row_{}", row_offset + row);
+        let mut state = FilterState::with_capacity(field_count);
+        let mut row_offset = 0usize;
 
-            match state.check(&point, &cfg.filter) {
-                Ok(()) => {
-                    accepted += 1;
-                    let mut row_data = vec![point.timestamp_ns.to_string()];
-                    for metric in &point.metrics {
-                        row_data.push(metric.to_string());
+        let ncfg = &cfg.normalizer;
+        let ts_field = ncfg.timestamp_field.as_deref();
+
+        for maybe_chunk in chunks {
+            let chunk = maybe_chunk.context("read parquet chunk")?;
+            let names: Vec<String> = chunk
+                .arrays()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, _)| schema.fields.get(i).map(|f| f.name.clone()))
+                .collect();
+
+            let mut metric_indices: Vec<usize> = vec![0; field_count];
+            for (source_field, &index) in field_map.iter() {
+                if index >= field_count {
+                    return Err(anyhow!(
+                        "field_map index {} exceeds field_count {}",
+                        index,
+                        field_count
+                    ));
+                }
+                let col_idx = names
+                    .iter()
+                    .position(|n| n == source_field)
+                    .ok_or_else(|| anyhow!("parquet missing column: {}", source_field))?;
+                metric_indices[index] = col_idx;
+            }
+            let ts_idx = ts_field.and_then(|f| names.iter().position(|n| n == f));
+            let ts_arr = ts_idx.map(|i| chunk.arrays()[i].as_ref());
+
+            let len = chunk.arrays()[0].len();
+            for row in 0..len {
+                let processed = row_offset + row;
+                if processed != 0 && processed % YIELD_RECORDS == 0 {
+                    std::thread::yield_now();
+                }
+                let mut metrics = vec![0.0; field_count];
+                for (idx, &col_idx) in metric_indices.iter().enumerate() {
+                    metrics[idx] = extract_f64(chunk.arrays()[col_idx].as_ref(), row)?;
+                }
+
+                let timestamp_ns =
+                    if let (Some(ts_arr), Some(fmt)) = (ts_arr, &ncfg.timestamp_format) {
+                        let ts_str = extract_str(ts_arr, row).unwrap_or_default();
+                        parse_datetime_to_ns(&ts_str, fmt, ncfg.timestamp_date_override.as_deref())?
+                    } else if let Some(ts_arr) = ts_arr {
+                        if let Ok(n) = extract_f64(ts_arr, row) {
+                            let unit = ncfg.timestamp_unit.as_deref().unwrap_or("ms");
+                            parse_ts_to_ns(&format!("{}", n), unit, ncfg.timestamp_tick_hz)?
+                        } else {
+                            now_unix_ms() * 1_000_000
+                        }
+                    } else {
+                        now_unix_ms() * 1_000_000
+                    };
+
+                let point = DataPoint {
+                    timestamp_ns,
+                    metrics,
+                };
+
+                let raw_record = format!("row_{}", row_offset + row);
+
+                match state.check(&point, &cfg.filter) {
+                    Ok(()) => {
+                        accepted += 1;
+                        let mut row_data = vec![point.timestamp_ns.to_string()];
+                        for metric in &point.metrics {
+                            row_data.push(metric.to_string());
+                        }
+                        accepted_writer.write_record(&row_data)?;
                     }
-                    accepted_writer.write_record(&row_data)?;
-                }
-                Err(reason) => {
-                    dropped += 1;
-                    write_deadletter_jsonl(cfg, &mut dead_file, &reason, &raw_record)?;
+                    Err(reason) => {
+                        dropped += 1;
+                        write_deadletter_jsonl_at(
+                            cfg,
+                            &mut dead_file,
+                            &reason,
+                            &raw_record,
+                            point.timestamp_ns,
+                        )?;
+                    }
                 }
             }
+            row_offset += len;
         }
-        row_offset += len;
-    }
 
-    accepted_writer.flush()?;
-    dead_file.flush()?;
+        accepted_writer.flush()?;
+        dead_file.flush()?;
+    }
     println!(
         "t3thr file (parquet) done | accepted={} dropped={} | accepted_path={} dead_letter_path={}",
         accepted,
         dropped,
         accepted_path.display(),
         dead_path.display()
+    );
+
+    println!(
+        "t3thr_metrics accepted={} dropped={} status=FILE_EOF",
+        accepted, dropped
     );
     Ok(())
 }
@@ -898,6 +1151,83 @@ fn extract_f64(array: &dyn Array, index: usize) -> Result<f64> {
 }
 
 #[cfg(feature = "full_engine")]
+fn extract_json_value(array: &dyn Array, index: usize) -> Value {
+    use arrow2::array::{BooleanArray, PrimitiveArray, Utf8Array};
+    use arrow2::datatypes::DataType;
+    if array.is_null(index) {
+        return Value::Null;
+    }
+    match array.data_type() {
+        DataType::Float64 => array
+            .as_any()
+            .downcast_ref::<arrow2::array::Float64Array>()
+            .map(|a| Value::from(a.value(index)))
+            .unwrap_or(Value::Null),
+        DataType::Float32 => array
+            .as_any()
+            .downcast_ref::<arrow2::array::Float32Array>()
+            .map(|a| Value::from(a.value(index) as f64))
+            .unwrap_or(Value::Null),
+        DataType::Int64 => array
+            .as_any()
+            .downcast_ref::<PrimitiveArray<i64>>()
+            .map(|a| Value::from(a.value(index)))
+            .unwrap_or(Value::Null),
+        DataType::UInt64 => array
+            .as_any()
+            .downcast_ref::<PrimitiveArray<u64>>()
+            .map(|a| Value::from(a.value(index)))
+            .unwrap_or(Value::Null),
+        DataType::Int32 => array
+            .as_any()
+            .downcast_ref::<PrimitiveArray<i32>>()
+            .map(|a| Value::from(a.value(index)))
+            .unwrap_or(Value::Null),
+        DataType::UInt32 => array
+            .as_any()
+            .downcast_ref::<PrimitiveArray<u32>>()
+            .map(|a| Value::from(a.value(index)))
+            .unwrap_or(Value::Null),
+        DataType::Int16 => array
+            .as_any()
+            .downcast_ref::<PrimitiveArray<i16>>()
+            .map(|a| Value::from(a.value(index)))
+            .unwrap_or(Value::Null),
+        DataType::UInt16 => array
+            .as_any()
+            .downcast_ref::<PrimitiveArray<u16>>()
+            .map(|a| Value::from(a.value(index)))
+            .unwrap_or(Value::Null),
+        DataType::Int8 => array
+            .as_any()
+            .downcast_ref::<PrimitiveArray<i8>>()
+            .map(|a| Value::from(a.value(index)))
+            .unwrap_or(Value::Null),
+        DataType::UInt8 => array
+            .as_any()
+            .downcast_ref::<PrimitiveArray<u8>>()
+            .map(|a| Value::from(a.value(index)))
+            .unwrap_or(Value::Null),
+        DataType::Boolean => array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .map(|a| Value::from(a.value(index)))
+            .unwrap_or(Value::Null),
+        DataType::Utf8 => array
+            .as_any()
+            .downcast_ref::<Utf8Array<i32>>()
+            .map(|a| Value::from(a.value(index)))
+            .unwrap_or(Value::Null),
+        DataType::LargeUtf8 => array
+            .as_any()
+            .downcast_ref::<Utf8Array<i64>>()
+            .map(|a| Value::from(a.value(index)))
+            .unwrap_or(Value::Null),
+        _ => Value::Null,
+    }
+}
+
+#[cfg(feature = "full_engine")]
 fn extract_str(array: &dyn Array, index: usize) -> Option<String> {
     use arrow2::array::Utf8Array;
     use arrow2::datatypes::DataType;
@@ -941,8 +1271,13 @@ where
     let mut state = FilterState::default();
     let mut accepted = 0usize;
     let mut dropped = 0usize;
+    let mut processed = 0usize;
 
     for record in records {
+        if processed != 0 && processed % YIELD_RECORDS == 0 {
+            std::thread::yield_now();
+        }
+        processed += 1;
         let parsed = parse(&record);
         let tick = match parsed {
             Ok(t) => t,
@@ -975,7 +1310,7 @@ where
             Err(reason) => {
                 dropped += 1;
                 let raw = raw_record(&record);
-                write_deadletter_jsonl(cfg, &mut dead_file, &reason, &raw)?;
+                write_deadletter_jsonl_at(cfg, &mut dead_file, &reason, &raw, tick.timestamp_ns)?;
             }
         }
     }
@@ -988,6 +1323,11 @@ where
         dropped,
         accepted_path.display(),
         dead_path.display()
+    );
+
+    println!(
+        "t3thr_metrics accepted={} dropped={} status=FILE_EOF",
+        accepted, dropped
     );
     Ok(())
 }

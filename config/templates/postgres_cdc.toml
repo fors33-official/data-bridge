@@ -1,0 +1,33 @@
+[connector.cdc]
+engine = "postgres"
+field_paths = ["price", "volume"]
+
+[connector.cdc.postgres_config]
+host = "db"
+port = 5432
+database = "app"
+user = "replication"
+password = "${FORS33_SECRET_CONNECTOR__CDC_POSTGRES__PASSWORD}"
+slot_name = "fors33_slot"
+publication_name = "fors33_pub"
+
+[normalizer]
+field_count = 2
+field_map = { price = 0, volume = 1 }
+
+[filter]
+reject_nan_inf = true
+price_min = 0.0
+price_max = 1000000.0
+volume_min = 0.0
+volume_max = 10000000.0
+volume_burst_max_ratio = 10000.0
+burst_ema_alpha = 0.05
+future_tolerance_ms = 2000
+stale_tolerance_ms = 600000
+replay_mode = false
+drop_on_parse_error = true
+
+[output]
+accepted_path = "out/postgres_cdc_accepted.csv"
+dead_letter_path = "out/postgres_cdc_dead.csv"

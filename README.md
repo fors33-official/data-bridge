@@ -1,8 +1,8 @@
 # Fors33 T3thr
 
 [![CI](https://img.shields.io/github/actions/workflow/status/fors33-official/data-bridge/release.yml?branch=main&style=flat-square)](https://github.com/fors33-official/data-bridge/actions)
-[![Release](https://img.shields.io/badge/release-0.4.0-blue?style=flat-square)](https://github.com/fors33-official/data-bridge/releases)
-[![Docker Tag](https://img.shields.io/badge/docker-0.4.0%20%7C%20latest-2496ED?style=flat-square&logo=docker&logoColor=white)](https://hub.docker.com/r/fors33/data-bridge)
+[![Release](https://img.shields.io/badge/release-0.5.0-blue?style=flat-square)](https://github.com/fors33-official/data-bridge/releases)
+[![Docker Tag](https://img.shields.io/badge/docker-0.5.0%20%7C%20latest-2496ED?style=flat-square&logo=docker&logoColor=white)](https://hub.docker.com/r/fors33/data-bridge)
 [![Docker Pulls](https://img.shields.io/docker/pulls/fors33/data-bridge?style=flat-square)](https://hub.docker.com/r/fors33/data-bridge)
 [![License](https://img.shields.io/github/license/fors33-official/data-bridge?style=flat-square)](https://github.com/fors33-official/data-bridge/blob/main/LICENSE)
 
@@ -59,7 +59,7 @@ docker run --rm `
 You can also pull from GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/fors33-official/data-bridge:0.4.0
+docker pull ghcr.io/fors33-official/data-bridge:0.5.0
 docker pull ghcr.io/fors33-official/data-bridge:latest
 ```
 
@@ -75,57 +75,61 @@ docker run --rm \
   --config /app/config/default.toml
 ```
 
-### New in 0.4.0
+### CLI overview
 
-**Frictionless Configuration:** Zero-configuration setup for standard providers. The config wizard now auto-generates complete configs for Kraken, Binance, Alchemy, Infura, PostgreSQL, MySQL, and more with pre-filled endpoints and ports.
+- **Legacy style (unchanged):** `t3thr --config /app/config/default.toml` (equivalent to `t3thr run --config …`).
+- **Explicit subcommands:** `t3thr run …`, **`t3thr generate --connector <slug>`** (templates under `config/templates/`), **`t3thr validate --config …`**, **`t3thr migrate …`**, **`t3thr wizard`** (same as the `config_wizard` binary).
+- **Thin wrappers:** `validate_config`, `migrate_config` binaries delegate to **`t3thr`** (stable for scripting).
 
-**Config Wizard:** Interactive setup with provider selection and pre-filled endpoints. Run `t3thr --config-wizard` to generate complete configs automatically.
+<details>
+<summary><strong>Release notes (expand)</strong></summary>
 
-**Pre-configured Templates:** 10 ready-to-use templates in `config/` directory:
-- WebSocket: Kraken, Binance (Spot/Futures), Alchemy, Infura
-- CDC: PostgreSQL (port 5432), MySQL (port 3306)
-- Infrastructure: Syslog (port 514), Kafka (port 9092), MQTT (port 1883), gRPC (port 50051)
+<details open>
+<summary>0.5.0 – Extension Rust bridge parity (standalone)</summary>
 
-**New Connectors:** Full support for syslog (RFC 5424/3164), UDP JSON datagrams, CDC (Postgres/MySQL), Message Bus (Kafka/MQTT), and gRPC.
+Summary: Rust stack matches the Fors33 Data Latch **extension bridge** (`t3thr_bridge`) for TLS observability (`[T3thr:CONNECTION_META]`), rustls-centric connectors, **`FORS33_SECRET_*`** placeholder expansion (additive next to **`T3THR_*`** env tables), nested Kafka/MQTT config, **`t3thr generate`** from embedded **`config/templates/`**, state file locking, Tokio **`block_in_place`** for file ingestion, unified subcommand CLI with **backward-compatible** bare **`--config`**, **`--validate-only`**, **`--config-wizard`**, and retained **`validate_config`** / **`migrate_config`** binaries. Published images now include **`config_wizard`**, **`validate_config`**, and **`migrate_config`** under `/usr/local/bin/`.
 
-**Batch Processing Mode:** Process historical data and exit on completion. Enable with `mode = "batch"` in file or REST connectors.
+Technical note: **`config`** crate merges **`FORS33_SECRET`** with `__` separators after loading the file (see [`docs/bridge-release-notes-0.5.0.md`](docs/bridge-release-notes-0.5.0.md)).
 
-**State Tracking:** Resume interrupted batch jobs from last position using `.t3thr-state.json`.
+</details>
 
-**Enhanced CLI Flags:**
-- `--config-wizard` - Interactive configuration setup
-- `--reset-state` - Delete state file for fresh start
-- `--no-state` - Disable state tracking
+<details>
+<summary>0.4.0 – wizard, connectors, batch</summary>
 
-**GitHub Migration:** Public repository with manual GitHub Actions workflow for releases.
+- **Frictionless configuration:** Wizard and templates for standard providers (Kraken, Binance, Alchemy, Infura, Postgres, MySQL, and more).
+- **Interactive wizard:** run **`cargo run --bin config_wizard`**, **`t3thr wizard`**, or **`t3thr --config-wizard`**.
+- **Pre-configured examples:** **`config/`** directory (sample TOMLs); canonical generator templates live under **`config/templates/`** from 0.5.0 onward.
+- **Connectors:** Syslog (RFC 5424/3164), UDP JSON, CDC (Postgres/MySQL), Kafka/MQTT, gRPC.
+- **Batch mode:** **`mode = "batch"`**; state file **`.t3thr-state.json`** with **`--reset-state`** / **`--no-state`**.
+- **Registries:** Docker Hub **`fors33/data-bridge`** and **`ghcr.io/fors33-official/data-bridge`**.
 
-**Dual Registry Support:** Available on Docker Hub (`fors33/data-bridge`) and GitHub Container Registry (`ghcr.io/fors33-official/data-bridge`).
+</details>
 
-**Environment Variable Patterns:** Secure secret management with `T3THR_*` prefix for all connector secrets.
+<details>
+<summary>0.3.0 – secrets in the environment, not on disk</summary>
 
-### 0.3.0: secrets in the environment, not on disk
-
-**Preferred (direct mapping):** optional tables map a wire key to an **environment variable name** (must match `T3THR_[A-Z0-9_]+`). The process reads `std::env::var`, trims, and sends the value as-is (no string concatenation—put a full `Bearer …` string in the env var if needed).
+**Preferred (direct mapping):** optional **`env_*`** tables map a wire key to an **environment variable name** (`T3THR_[A-Z0-9_]+`). Values are sent as-is (put a full `Bearer …` in the env var if needed).
 
 - `[connector.rest.env_headers]`
 - `[connector.websocket.env_headers]`
 - `[connector.grpc.env_metadata]`
-- `[connector.message_bus.env_client_properties]`
+- `[connector.message_bus.kafka.env_client_properties]` / `[connector.message_bus.mqtt.env_client_properties]` (nested; Kafka/MQTT also support literal **`client_properties`** maps)
 
-**Literal-only tables** (no env indirection): `[connector.rest.headers]`, `[connector.websocket.headers]`, `[connector.grpc.metadata]`, `[connector.message_bus.client_properties]`.
+**Deprecated path:** whole-value **`${T3THR_*}`** in literal maps still resolves with **`[DEPRECATION]`** warning.
 
-**Deprecated (one release):** a whole-value template `${T3THR_*}` inside a literal table still resolves, but prints `[Fors33] [DEPRECATION]` to stderr—migrate to the matching `env_*` table.
+**License key PEM:** optional **`FORS33_RUNTIME_PUBKEY_PEM`** for local Ed25519 verification before embedded issuer PEM.
 
-**Placeholder rule (deprecated path only):** value must match `^\$\{([A-Z0-9_]+)\}$`; name must start with `T3THR_`; missing or empty after trim is a hard error.
+**Validate:** `validate_config path/to.toml` or `t3thr validate --config …` or **`t3thr --validate-only --config …`**.
 
-**License key PEM override:** if `FORS33_RUNTIME_PUBKEY_PEM` is set and non-empty after trim, the bridge uses that Ed25519 public PEM to verify `FORS33_LICENSE_KEY` before falling back to the embedded issuer PEM.
+The default **slim** build supports **file**, **CSV**, and **REST**; **full_engine** adds WebSocket, message bus, gRPC, syslog, UDP raw, CDC, Parquet (the **`fors33/data-bridge`** image builds with **`full_engine`**).
 
-**Validate config:** `cargo run --release --bin validate_config -- path/to/config.toml` (or `t3thr --validate-only --config …`) runs the same parse, normalization, and env binding resolution as a normal start, including the live license check when applicable.
+</details>
 
-The default **slim** binary supports **file**, **CSV**, and **REST**; **WebSocket**, **message_bus**, **gRPC**, **syslog**, **UDP raw**, **CDC** (Postgres/MySQL), and **Parquet** file input require a build with `--features full_engine` (the published `fors33/data-bridge` image uses `full_engine`).
+</details>
 
 ## Documentation
 
+- [`docs/bridge-release-notes-0.5.0.md`](docs/bridge-release-notes-0.5.0.md)
 - `docs/QUICK_START.md`
 - `pkg/README.md`
 - `docs/license_backend_contract.md`

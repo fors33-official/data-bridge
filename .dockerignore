@@ -19,8 +19,11 @@
 # Internal documentation (entire folder is maintainer-only)
 /docs/
 
-# Config files not needed in build context - users mount at runtime
-/config/
+# Root config examples are mounted at runtime, not copied into the runtime image layers.
+# `config/templates/` must stay in the build context: `include_str!` in src/commands/generate.rs.
+config/*
+!config/templates/
+!config/templates/**
 
 # Secrets / credentials
 .env
@@ -34,6 +37,7 @@
 /.git/
 /.gitignore
 /.gitattributes
+/.github/
 /.cursor/
 .cursorignore
 /.vscode/

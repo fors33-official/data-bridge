@@ -12,7 +12,9 @@ fn main() -> io::Result<()> {
     println!("\n=== Fors33 T3thr Configuration Wizard ===\n");
     println!("This wizard will help you create a configuration file for your data pipeline.\n");
     println!("For live connectors, secret values are **not** stored in the file.\n");
-    println!("You will name environment variables (prefix T3THR_) and the config will use ${{VAR}} placeholders.\n");
+    println!(
+        "You will name environment variables (prefix T3THR_) and the config will use ${{VAR}} placeholders.\n"
+    );
 
     // 1. Data source type
     println!("1. What type of data source do you have?");
@@ -170,8 +172,14 @@ fn main() -> io::Result<()> {
     println!("\n=== Next Steps ===");
     println!("1. Save this config to: config/{}", config_name);
     println!("2. Set the referenced T3THR_* variables in your process or container environment.");
-    println!("3. Validate: cargo run --release --bin validate_config -- config/{}", config_name);
-    println!("4. Run: cargo run --release --features full_engine -- --config config/{}", config_name);
+    println!(
+        "3. Validate: cargo run --release --bin validate_config -- config/{}",
+        config_name
+    );
+    println!(
+        "4. Run: cargo run --release --features full_engine -- --config config/{}",
+        config_name
+    );
 
     let save = prompt_yes_no("\nSave this config now?")?;
     if save {
@@ -214,9 +222,8 @@ fn collect_credential_placeholders(source_type: char) -> io::Result<CredFragment
                     "Define the environment variable name for the REST header value (e.g. T3THR_REST_TOKEN). \
                      Put the full header value in that variable at runtime (for example \"Bearer <token>\" if you use Bearer auth):",
                 )?;
-                let header_name = prompt_string(
-                    "HTTP header name to send (press Enter for Authorization):",
-                )?;
+                let header_name =
+                    prompt_string("HTTP header name to send (press Enter for Authorization):")?;
                 let h = if header_name.trim().is_empty() {
                     "Authorization".to_string()
                 } else {
@@ -236,9 +243,8 @@ fn collect_credential_placeholders(source_type: char) -> io::Result<CredFragment
                 let var = prompt_t3thr_env_key(
                     "Define the environment variable name for the WebSocket handshake header value (e.g. T3THR_WEBSOCKET_TOKEN):",
                 )?;
-                let header_name = prompt_string(
-                    "Handshake header name (press Enter for Authorization):",
-                )?;
+                let header_name =
+                    prompt_string("Handshake header name (press Enter for Authorization):")?;
                 let h = if header_name.trim().is_empty() {
                     "Authorization".to_string()
                 } else {
@@ -285,9 +291,8 @@ fn collect_credential_placeholders(source_type: char) -> io::Result<CredFragment
             if prompt_yes_no(
                 "\nWill gRPC calls attach a secret metadata value (e.g. authorization bearer or API key)?",
             )? {
-                let meta_key = prompt_string(
-                    "gRPC metadata key to send (press Enter for authorization):",
-                )?;
+                let meta_key =
+                    prompt_string("gRPC metadata key to send (press Enter for authorization):")?;
                 let k = if meta_key.trim().is_empty() {
                     "authorization".to_string()
                 } else {
@@ -342,7 +347,9 @@ fn prompt_t3thr_env_key(prompt: &str) -> io::Result<String> {
         if is_valid_t3thr_env_name(&s) {
             return Ok(s);
         }
-        println!("Invalid name. Use only A-Z, 0-9, and underscore after the T3THR_ prefix (e.g. T3THR_REST_TOKEN).");
+        println!(
+            "Invalid name. Use only A-Z, 0-9, and underscore after the T3THR_ prefix (e.g. T3THR_REST_TOKEN)."
+        );
     }
 }
 
@@ -469,19 +476,28 @@ fn generate_config(
                     config.push_str("url = \"wss://fstream.binance.com/ws/\"\n");
                     config.push_str("provider = \"binance\"\n");
                     config.push_str("stream = \"btcusdt@trade\"  # Replace with your symbol\n");
-                    config.push_str("# Binance Futures uses built-in parsing - field_paths not required\n");
+                    config.push_str(
+                        "# Binance Futures uses built-in parsing - field_paths not required\n",
+                    );
                 }
                 Some("alchemy") => {
-                    config.push_str("url = \"wss://eth-mainnet.g.alchemy.com/v2/${T3THR_ALCHEMY_KEY}\"\n");
+                    config.push_str(
+                        "url = \"wss://eth-mainnet.g.alchemy.com/v2/${T3THR_ALCHEMY_KEY}\"\n",
+                    );
                     config.push_str("provider = \"alchemy\"\n");
-                    config.push_str("# Set T3THR_ALCHEMY_KEY environment variable with your Alchemy API key\n");
+                    config.push_str(
+                        "# Set T3THR_ALCHEMY_KEY environment variable with your Alchemy API key\n",
+                    );
                     let fp = json_array_string(field_names);
                     config.push_str(&format!("field_paths = {}\n", fp));
                 }
                 Some("infura") => {
-                    config.push_str("url = \"wss://mainnet.infura.io/ws/v3/${T3THR_INFURA_KEY}\"\n");
+                    config
+                        .push_str("url = \"wss://mainnet.infura.io/ws/v3/${T3THR_INFURA_KEY}\"\n");
                     config.push_str("provider = \"infura\"\n");
-                    config.push_str("# Set T3THR_INFURA_KEY environment variable with your Infura API key\n");
+                    config.push_str(
+                        "# Set T3THR_INFURA_KEY environment variable with your Infura API key\n",
+                    );
                     let fp = json_array_string(field_names);
                     config.push_str(&format!("field_paths = {}\n", fp));
                 }
@@ -577,7 +593,10 @@ fn generate_config(
     }
 
     config.push_str("\n[output]\n");
-    config.push_str(&format!("accepted_path = \"out/{}_accepted.csv\"\n", output_name));
+    config.push_str(&format!(
+        "accepted_path = \"out/{}_accepted.csv\"\n",
+        output_name
+    ));
     config.push_str(&format!(
         "dead_letter_path = \"out/{}_dead.csv\"\n",
         output_name

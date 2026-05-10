@@ -1,34 +1,50 @@
 [package]
 name = "t3thr"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1"
-chrono = { version = "0.4", features = ["std"], default-features = false }
+chrono = { version = "0.4", features = ["std", "clock"], default-features = false }
 clap = { version = "4", features = ["derive"] }
 csv = "1"
+config = "0.14"
+fslock = "0.2"
 hex = "0.4"
 jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
-reqwest = { version = "0.11", features = ["json", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls", "rustls-tls-webpki-roots"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ryu = "1"
 sha2 = "0.10"
-walkdir = "2"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
+walkdir = "2"
 
-# full_engine: Kafka/MQTT, WebSocket, gRPC, Parquet input, CDC connectors
+# TLS observability backbone: unconditional across all builds.
+# `x509-parser` is used for leaf-certificate metadata parsing and stays
+# ungated. `rustls` + helpers provide the shared verifier-wrapper API that
+# every TLS-capable connector plugs into.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "logging", "tls12"] }
+rustls-pki-types = "1"
+rustls-pemfile = "2"
+rustls-native-certs = "0.7"
+webpki-roots = "0.26"
+x509-parser = "0.16"
+
+# full_engine: Kafka/MQTT, WebSocket, gRPC, Parquet input
 arrow2 = { version = "0.18", features = ["io_parquet", "io_parquet_compression"], optional = true }
 futures-util = { version = "0.3", optional = true }
 rdkafka = { version = "0.36", features = ["cmake-build"], optional = true }
 rumqttc = { version = "0.25", optional = true }
-tokio-tungstenite = { version = "0.21", features = ["native-tls"], optional = true }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"], optional = true }
 tonic = { version = "0.14", optional = true }
 tonic-prost = { version = "0.14", optional = true }
 prost = { version = "0.14", optional = true }
 tokio-postgres = { version = "0.7", optional = true }
-mysql_async = { version = "0.34", optional = true }
+tokio-postgres-rustls = { version = "0.13", optional = true }
+mysql = { version = "24.0", optional = true, default-features = false, features = ["minimal", "rustls-tls"] }
 
 [build-dependencies]
 protoc-bin-vendored = { version = "3", optional = true }
@@ -47,13 +63,15 @@ full_engine = [
     "dep:rdkafka",
     "dep:rumqttc",
     "dep:tokio-tungstenite",
+    "dep:tokio-rustls",
     "dep:tonic",
     "dep:tonic-prost",
     "dep:prost",
     "dep:protoc-bin-vendored",
     "dep:tonic-prost-build",
     "dep:tokio-postgres",
-    "dep:mysql_async",
+    "dep:tokio-postgres-rustls",
+    "dep:mysql",
 ]
 
 [profile.release]

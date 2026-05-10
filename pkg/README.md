@@ -1,15 +1,15 @@
-## Docker image: Fors33 Data-bridge (single bridge binary)
+## Docker image: Fors33 Data-bridge (main binary + compat helpers)
 
-This directory contains packaging assets for building the single Docker image that runs the bridge binary with a **free File/CSV tier** and **Pro live connectors** gated by `FORS33_LICENSE_KEY`.
+This directory contains packaging assets for the bridge image: primary entrypoint **`t3thr`**, plus **`config_wizard`**, **`validate_config`**, and **`migrate_config`** copied into `/usr/local/bin/` for legacy operator flows. **Free File/CSV tier** and **Pro live connectors** remain gated by `FORS33_LICENSE_KEY`.
 
 ### Build (multi-arch example)
 
-**Docker Hub tags:** use numeric semver only (e.g. `0.3.0`), not a `v` prefix, plus `latest`.
+**Docker Hub tags:** use numeric semver only (e.g. `0.5.0`), not a `v` prefix, plus `latest`.
 
 ```bash
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
-  -t fors33/data-bridge:0.3.0 \
+  -t fors33/data-bridge:0.5.0 \
   -t fors33/data-bridge:latest \
   -f pkg/Dockerfile \
   .
@@ -78,11 +78,11 @@ docker run \
   --config /app/config/file_example.toml
 ```
 
-### Connector maps and `T3THR_*` (0.3.0+)
+### Connector maps, `T3THR_*`, and `${FORS33_SECRET_*}` (0.5.0+)
 
-Prefer **`env_*` tables** (`[connector.rest.env_headers]`, `[connector.websocket.env_headers]`, `[connector.grpc.env_metadata]`, `[connector.message_bus.env_client_properties]`): each value is an environment variable **name** (`T3THR_*`); the resolved value is sent on the wire as-is. Literal maps (`headers`, `metadata`, `client_properties`) hold non-secret strings only; whole-value `${T3THR_*}` in literals is deprecated (still resolved one release, with stderr warning). Optional `FORS33_RUNTIME_PUBKEY_PEM` overrides the embedded Ed25519 public key for JWT verification.
+Prefer **`env_*` tables** (`[connector.rest.env_headers]`, `[connector.websocket.env_headers]`, `[connector.grpc.env_metadata]`, `[connector.message_bus.env_client_properties]`): each value is an environment variable **name** (`T3THR_*`); the resolved value is sent on the wire as-is. Literal maps (`headers`, `metadata`, `client_properties`) hold non-secret strings only; whole-value `${T3THR_*}` in literals is deprecated (still resolved one release, with stderr warning). **`${FORS33_SECRET_*}`** tokens in wire strings and nested client properties resolve from env at runtime (**additive**). Optional `FORS33_RUNTIME_PUBKEY_PEM` overrides the embedded Ed25519 public key for JWT verification.
 
-Validate before run: `t3thr --validate-only --config /app/config/your.toml`.
+Validate before run: `t3thr --validate-only --config /app/config/your.toml` (bare `t3thr --config …` without `run` is still accepted).
 
 ### Pro tier: Live connectors (WebSocket / REST / Message Bus / gRPC)
 

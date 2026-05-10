@@ -1,478 +1,263 @@
-//! Syslog connector supporting RFC 5424 and RFC 3164 formats.
-//! Supports TCP and UDP transport, both listener and client modes.
+//! Plaintext syslog ingest: RFC 5424 then RFC 3164; TCP or UDP; listen or dial.
+//! DataPoint time uses parsed header timestamp when present; otherwise wall clock.
+//! Metrics are placeholder values (1.0 per field index) so N-field bounds stay contract-aligned.
 
-use std::net::SocketAddr;
 use std::sync::mpsc::SyncSender;
 
-use anyhow::{anyhow, Result};
-use serde::Deserialize;
-use tokio::io::AsyncBufReadExt;
+use anyhow::{Context, Result, anyhow};
+use chrono::{Datelike, NaiveDate, NaiveTime, TimeZone, Utc};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-use crate::{now_unix_ms, DataPoint, FilterCfg, FilterState};
+use crate::{DataPoint, FilterCfg, FilterState, now_unix_ms};
 
-const SYSLOG_DEFAULT_PORT: u16 = 514;
-
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub struct SyslogCfg {
-    #[serde(default = "default_syslog_format")]
-    pub syslog_format: String, // "rfc5424" | "rfc3164"
-    #[serde(default = "default_syslog_transport")]
-    pub transport: String, // "tcp" | "udp"
-    pub listen_address: Option<String>, // For server mode
-    pub connect_address: Option<String>, // For client mode
-    #[serde(default = "default_syslog_port")]
-    pub port: u16,
-    #[serde(default)]
-    pub field_paths: Vec<String>, // JSONPaths to extract metrics from message payload
+    pub format: String,
+    pub transport: String,
+    pub listen_address: Option<String>,
+    pub connect_address: Option<String>,
 }
 
-fn default_syslog_format() -> String {
-    "rfc5424".to_string()
+fn placeholder_metrics(field_count: usize) -> Vec<f64> {
+    vec![1.0_f64; field_count.max(1)]
 }
 
-fn default_syslog_transport() -> String {
-    "udp".to_string()
-}
-
-fn default_syslog_port() -> u16 {
-    SYSLOG_DEFAULT_PORT
-}
-
-/// Parse RFC 5424 syslog message
-/// Format: <priority>version timestamp hostname app-name proc-id msg-id structured-data message
-fn parse_rfc5424(line: &str) -> Result<(Option<String>, String)> {
-    // Remove leading priority if present
-    let line = if let Some(start) = line.find('>') {
-        &line[start + 1..]
-    } else {
-        line
-    };
-
-    // Parse version (first char should be '1' for RFC 5424)
-    if line.is_empty() {
-        return Err(anyhow!("empty syslog message"));
+fn rfc3339_or_similar_to_ns(s: &str) -> Option<u64> {
+    let t = s.trim();
+    if t.is_empty() || t == "-" {
+        return None;
     }
-
-    // Split by space, RFC 5424 has: version timestamp hostname app-name proc-id msg-id [structured-data] message
-    let parts: Vec<&str> = line.splitn(8, ' ').collect();
-    if parts.len() < 7 {
-        // Not enough fields for RFC 5424, treat entire line as message
-        return Ok((None, line.to_string()));
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(t) {
+        return Some(dt.timestamp_nanos_opt().unwrap_or(0) as u64);
     }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%dT%H:%M:%S%.fZ") {
+        let dt = Utc.from_utc_datetime(&ndt);
+        return Some(dt.timestamp_nanos_opt().unwrap_or(0) as u64);
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S%.f") {
+        let dt = Utc.from_utc_datetime(&ndt);
+        return Some(dt.timestamp_nanos_opt().unwrap_or(0) as u64);
+    }
+    None
+}
 
-    // Extract timestamp from field 1
-    let timestamp = if parts[1] != "-" {
-        Some(parts[1].to_string())
-    } else {
-        None
+/// RFC 5424: HEADER fields up to structured-data; timestamp is third token after PRI+VERSION.
+fn parse_rfc5424_header_time_ns(line: &str) -> Option<u64> {
+    let rest = line.strip_prefix('<')?;
+    let gt = rest.find('>')?;
+    let after = rest[gt + 1..].trim_start();
+    let mut it = after.split_whitespace();
+    let _ver = it.next()?;
+    let ts = it.next()?;
+    rfc3339_or_similar_to_ns(ts)
+}
+
+/// RFC 3164: `<pri>MMM DD hh:mm:ss HOST TAG: msg`
+fn parse_rfc3164_header_time_ns(line: &str, year: i32) -> Option<u64> {
+    let rest = line.strip_prefix('<')?;
+    let gt = rest.find('>')?;
+    let after = rest[gt + 1..].trim_start();
+    let mut it = after.split_whitespace();
+    let mon = it.next()?;
+    let day: u32 = it.next()?.parse().ok()?;
+    let hms = it.next()?;
+    let naive_time = NaiveTime::parse_from_str(hms, "%H:%M:%S").ok()?;
+    let mon_num = match mon {
+        "Jan" => 1u32,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
     };
+    let nd = NaiveDate::from_ymd_opt(year, mon_num, day)?;
+    let ndt = nd.and_time(naive_time);
+    let dt = Utc.from_utc_datetime(&ndt);
+    Some(dt.timestamp_nanos_opt().unwrap_or(0) as u64)
+}
 
-    // Find message after structured-data (which is in brackets or "-")
-    let message_start = if parts.len() >= 7 {
-        // Look for structured data indicator
-        let sd_index = if parts[6].starts_with('[') || parts[6] == "-" {
-            7
-        } else {
-            // Message starts earlier
-            parts.iter().position(|p| !p.starts_with('[') && *p != "-").unwrap_or(parts.len())
-        };
-        if sd_index < parts.len() {
-            parts[sd_index..].join(" ")
-        } else {
-            String::new()
+fn line_timestamp_ns(line: &str, fmt: &str) -> u64 {
+    let fmt_lc = fmt.to_ascii_lowercase();
+    if fmt_lc == "rfc5424" {
+        if let Some(ns) = parse_rfc5424_header_time_ns(line) {
+            return ns;
         }
-    } else {
-        parts.last().map(|s| s.to_string()).unwrap_or_default()
-    };
-
-    Ok((timestamp, message_start))
-}
-
-/// Parse RFC 3164 syslog message (BSD syslog)
-/// Format: <priority>timestamp hostname tag: message
-fn parse_rfc3164(line: &str) -> Result<(Option<String>, String)> {
-    // Remove leading priority if present
-    let line = if let Some(start) = line.find('>') {
-        &line[start + 1..]
-    } else {
-        line
-    };
-
-    // RFC 3164 format: Mmm dd hh:mm:ss hostname tag: message
-    // The timestamp is always 15-16 characters at the start
-    if line.len() < 16 {
-        return Ok((None, line.to_string()));
-    }
-
-    let timestamp = &line[..15]; // Mmm dd hh:mm:ss
-    let remainder = &line[16..];
-
-    // Find where the message starts (after hostname and tag)
-    let parts: Vec<&str> = remainder.splitn(3, ' ').collect();
-    let message = if parts.len() >= 3 {
-        // Skip hostname and tag
-        let tag_part = parts[1];
-        if let Some(_colon_pos) = tag_part.find(':') {
-            parts[2].to_string()
-        } else {
-            // No tag separator found, try to find it in combined parts
-            if let Some(msg_start) = remainder.find(':') {
-                remainder[msg_start + 1..].trim().to_string()
-            } else {
-                remainder.to_string()
-            }
+    } else if fmt_lc == "rfc3164" {
+        let y = Utc::now().year();
+        if let Some(ns) = parse_rfc3164_header_time_ns(line, y) {
+            return ns;
         }
-    } else {
-        remainder.to_string()
-    };
-
-    Ok((Some(timestamp.to_string()), message))
-}
-
-/// Parse syslog message and extract timestamp and payload
-fn parse_syslog_message(line: &str, format: &str) -> Result<(Option<String>, String)> {
-    match format {
-        "rfc5424" => parse_rfc5424(line),
-        "rfc3164" => parse_rfc3164(line),
-        _ => Err(anyhow!("unsupported syslog format: {}", format)),
     }
-}
-
-/// Extract metrics from JSON payload using field_paths
-fn extract_metrics_from_json(
-    json_str: &str,
-    field_paths: &[String],
-) -> Result<(u64, Vec<f64>)> {
-    let value: serde_json::Value = serde_json::from_str(json_str)
-        .map_err(|e| anyhow!("failed to parse JSON payload: {}", e))?;
-
-    let timestamp_ns = now_unix_ms() * 1_000_000;
-
-    let mut metrics = Vec::with_capacity(field_paths.len());
-    for path in field_paths {
-        let metric_val = json_path_get_f64(&value, path).unwrap_or(0.0);
-        metrics.push(metric_val);
-    }
-
-    Ok((timestamp_ns, metrics))
-}
-
-/// Deep JSONPath extraction
-fn json_path_get_f64(value: &serde_json::Value, path: &str) -> Option<f64> {
-    let parts: Vec<&str> = path.split('.').collect();
-    let mut current = value;
-
-    for part in parts {
-        current = match current {
-            serde_json::Value::Object(map) => map.get(part)?,
-            serde_json::Value::Array(arr) => {
-                let i: usize = part.parse().ok()?;
-                arr.get(i)?
-            }
-            _ => return None,
-        };
-    }
-
-    match current {
-        serde_json::Value::Number(n) => n.as_f64(),
-        serde_json::Value::String(s) => s.parse().ok(),
-        _ => None,
-    }
-}
-
-/// Parse timestamp from syslog format to nanoseconds
-fn parse_syslog_timestamp(ts_str: &str) -> u64 {
-    // Try RFC 5424 format: 2024-01-15T10:30:00.123Z or 2024-01-15T10:30:00+00:00
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts_str) {
-        return dt.timestamp_nanos_opt().unwrap_or(0) as u64;
-    }
-
-    // Try RFC 3164 format: Jan 15 10:30:00
-    // Use current year from Unix timestamp (approximate)
-    let current_year = (now_unix_ms() / 1000 / 60 / 60 / 24 / 365) as i32 + 1970;
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(
-        &format!("{} {}", current_year, ts_str),
-        "%Y %b %d %H:%M:%S",
-    ) {
-        return dt.and_utc().timestamp_nanos_opt().unwrap_or(0) as u64;
-    }
-
-    // Fallback to current time
     now_unix_ms() * 1_000_000
 }
 
-/// Run syslog connector in TCP server mode
-async fn run_tcp_server(
-    cfg: &SyslogCfg,
-    tx: SyncSender<Result<DataPoint, (String, String)>>,
-    filter_cfg: &FilterCfg,
-) -> Result<()> {
-    let addr = cfg
-        .listen_address
-        .as_ref()
-        .map(|a| format!("{}:{}", a, cfg.port))
-        .unwrap_or_else(|| format!("0.0.0.0:{}", cfg.port));
-
-    let listener = TcpListener::bind(&addr).await?;
-    eprintln!("[Fors33] Syslog TCP server listening on {}", addr);
-
-    
-    loop {
-        let (stream, peer_addr) = listener.accept().await?;
-        eprintln!("[Fors33] Syslog TCP connection from {}", peer_addr);
-
-        let tx = tx.clone();
-        let cfg = cfg.clone();
-        let filter_cfg = filter_cfg.clone();
-
-        tokio::spawn(async move {
-            if let Err(e) = handle_tcp_stream(stream, &cfg, tx, &filter_cfg, peer_addr).await {
-                eprintln!("[Fors33] Syslog TCP stream error from {}: {}", peer_addr, e);
-            }
-        });
-    }
-}
-
-async fn handle_tcp_stream(
-    stream: TcpStream,
-    cfg: &SyslogCfg,
-    tx: SyncSender<Result<DataPoint, (String, String)>>,
-    filter_cfg: &FilterCfg,
-    peer_addr: SocketAddr,
-) -> Result<()> {
-    let reader = tokio::io::BufReader::new(stream);
-    let mut lines = reader.lines();
-    
-    while let Some(line) = lines.next_line().await? {
-        process_syslog_line(&line, cfg, &tx, filter_cfg, peer_addr.to_string().as_str())?;
-    }
-
-    Ok(())
-}
-
-/// Run syslog connector in UDP server mode
-async fn run_udp_server(
-    cfg: &SyslogCfg,
-    tx: SyncSender<Result<DataPoint, (String, String)>>,
-    filter_cfg: &FilterCfg,
-) -> Result<()> {
-    let addr = cfg
-        .listen_address
-        .as_ref()
-        .map(|a| format!("{}:{}", a, cfg.port))
-        .unwrap_or_else(|| format!("0.0.0.0:{}", cfg.port));
-
-    let socket = UdpSocket::bind(&addr).await?;
-    eprintln!("[Fors33] Syslog UDP server listening on {}", addr);
-
-    let mut buf = vec![0u8; 65535];
-    
-    loop {
-        let (len, peer_addr) = socket.recv_from(&mut buf).await?;
-        let line = String::from_utf8_lossy(&buf[..len]);
-
-        process_syslog_line(&line, cfg, &tx, filter_cfg, peer_addr.to_string().as_str())?;
-    }
-}
-
-/// Process a single syslog line and send to channel
-fn process_syslog_line(
+fn handle_one_syslog_line(
     line: &str,
     cfg: &SyslogCfg,
-    tx: &SyncSender<Result<DataPoint, (String, String)>>,
     filter_cfg: &FilterCfg,
-    _source: &str,
+    field_count: usize,
+    state: &mut FilterState,
+    tx: &SyncSender<Result<DataPoint, (String, String, Option<u64>)>>,
 ) -> Result<()> {
-    let line = line.trim();
-    if line.is_empty() {
-        return Ok(());
-    }
-
-    match parse_syslog_message(line, &cfg.syslog_format) {
-        Ok((timestamp_opt, message)) => {
-            let timestamp_ns = timestamp_opt
-                .map(|ts| parse_syslog_timestamp(&ts))
-                .unwrap_or_else(|| now_unix_ms() * 1_000_000);
-
-            let mut filter_state = FilterState::with_capacity(2);
-
-            // Try to parse message as JSON and extract metrics
-            let data_point = if !cfg.field_paths.is_empty() {
-                match extract_metrics_from_json(&message, &cfg.field_paths) {
-                    Ok((_, metrics)) => DataPoint {
-                        timestamp_ns,
-                        metrics,
-                    },
-                    Err(e) => {
-                        // Send to dead-letter as invalid JSON
-                        tx.send(Err((
-                            format!("Invalid JSON payload: {}", e),
-                            line.to_string(),
-                        )))
-                        .map_err(|_| anyhow!("channel closed"))?;
-                        return Ok(());
-                    }
-                }
-            } else {
-                // No field paths, treat entire message as single metric if parseable
-                let metric_val = message.parse::<f64>().unwrap_or(0.0);
-                DataPoint {
-                    timestamp_ns,
-                    metrics: vec![metric_val],
-                }
-            };
-
-            // Apply filter
-            match filter_state.check(&data_point, filter_cfg) {
-                Ok(()) => {
-                    tx.send(Ok(data_point))
-                        .map_err(|_| anyhow!("channel closed"))?;
-                }
-                Err(reason) => {
-                    tx.send(Err((reason, "Syslog filter violation".to_string())))
-                        .map_err(|_| anyhow!("channel closed"))?;
-                }
+    let ts_ns = line_timestamp_ns(line, &cfg.format);
+    let point = DataPoint {
+        timestamp_ns: ts_ns,
+        metrics: placeholder_metrics(field_count),
+    };
+    match state.check(&point, filter_cfg) {
+        Ok(()) => {
+            if tx.send(Ok(point)).is_err() {
+                eprintln!("[FORS33] FATAL: Writer channel closed. Stopping syslog connector.");
+                std::process::exit(1);
             }
         }
-        Err(e) => {
-            // Send to dead-letter
-            tx.send(Err((
-                format!("Syslog parse error: {}", e),
-                line.to_string(),
-            )))
-            .map_err(|_| anyhow!("channel closed"))?;
+        Err(reason) => {
+            if tx
+                .send(Err((reason, line.to_string(), Some(ts_ns))))
+                .is_err()
+            {
+                eprintln!("[FORS33] FATAL: Writer channel closed. Stopping syslog connector.");
+                std::process::exit(1);
+            }
         }
     }
-
     Ok(())
 }
 
-/// Run syslog connector in TCP client mode (connect to remote syslog server)
-async fn run_tcp_client(
+async fn syslog_tcp_lines<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
     cfg: &SyslogCfg,
-    _tx: SyncSender<Result<DataPoint, (String, String)>>,
-    _filter_cfg: &FilterCfg,
+    filter_cfg: &FilterCfg,
+    field_count: usize,
+    tx: SyncSender<Result<DataPoint, (String, String, Option<u64>)>>,
 ) -> Result<()> {
-    let addr = cfg
-        .connect_address
-        .as_ref()
-        .ok_or_else(|| anyhow!("connect_address required for TCP client mode"))?;
-
-    let _stream = TcpStream::connect(format!("{}:{}", addr, cfg.port)).await?;
-    eprintln!("[Fors33] Syslog TCP client connected to {}:{}", addr, cfg.port);
-
-    // Client mode for syslog is unusual - typically you'd send logs, not receive
-    // For now, just log connection success and return
-    // Future enhancement: implement bidirectional syslog or TLS syslog
-    eprintln!("[Fors33] Note: Syslog TCP client mode receives from remote - ensure server is configured to forward");
-
-    // Keep connection open
+    let mut br = BufReader::new(reader);
+    let mut line = String::new();
+    let mut state = FilterState::default();
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        line.clear();
+        let n = br.read_line(&mut line).await?;
+        if n == 0 {
+            break;
+        }
+        let s = line.trim_end_matches(['\r', '\n']);
+        if s.is_empty() {
+            continue;
+        }
+        handle_one_syslog_line(s, cfg, filter_cfg, field_count, &mut state, &tx)?;
     }
+    Ok(())
 }
 
-/// Run syslog connector in UDP client mode
-async fn run_udp_client(
-    cfg: &SyslogCfg,
-    _tx: SyncSender<Result<DataPoint, (String, String)>>,
-    _filter_cfg: &FilterCfg,
-) -> Result<()> {
-    let addr = cfg
-        .connect_address
-        .as_ref()
-        .ok_or_else(|| anyhow!("connect_address required for UDP client mode"))?;
-
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    socket.connect(format!("{}:{}", addr, cfg.port)).await?;
-
-    eprintln!("[Fors33] Syslog UDP client connected to {}:{}", addr, cfg.port);
-
-    // Similar to TCP client - keep open but this is receive-only
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-    }
-}
-
-/// Main entry point for syslog connector
 pub async fn run_syslog_connector(
     cfg: &SyslogCfg,
-    tx: SyncSender<Result<DataPoint, (String, String)>>,
     filter_cfg: &FilterCfg,
+    field_count: usize,
+    tx: SyncSender<Result<DataPoint, (String, String, Option<u64>)>>,
 ) -> Result<()> {
-    match cfg.transport.as_str() {
-        "tcp" => {
-            if cfg.listen_address.is_some() {
-                run_tcp_server(cfg, tx, filter_cfg).await
-            } else if cfg.connect_address.is_some() {
-                run_tcp_client(cfg, tx, filter_cfg).await
-            } else {
-                // Default to server mode on all interfaces
-                run_tcp_server(cfg, tx, filter_cfg).await
+    let transport = cfg.transport.to_ascii_lowercase();
+    let listen = cfg
+        .listen_address
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let connect = cfg
+        .connect_address
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+
+    match (listen, connect) {
+        (Some(bind_addr), None) if transport == "tcp" => {
+            let listener = TcpListener::bind(bind_addr)
+                .await
+                .with_context(|| format!("syslog tcp bind {}", bind_addr))?;
+            loop {
+                let (sock, _) = listener.accept().await?;
+                let cfg = cfg.clone();
+                let fc = filter_cfg.clone();
+                let txc = tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = syslog_tcp_lines(sock, &cfg, &fc, field_count, txc).await {
+                        eprintln!("[BRIDGE] syslog tcp session error: {}", e);
+                    }
+                });
             }
         }
-        "udp" => {
-            if cfg.listen_address.is_some() {
-                run_udp_server(cfg, tx, filter_cfg).await
-            } else if cfg.connect_address.is_some() {
-                run_udp_client(cfg, tx, filter_cfg).await
-            } else {
-                // Default to server mode
-                run_udp_server(cfg, tx, filter_cfg).await
+        (None, Some(addr)) if transport == "tcp" => {
+            let stream = TcpStream::connect(addr)
+                .await
+                .with_context(|| format!("syslog tcp connect {}", addr))?;
+            return syslog_tcp_lines(stream, cfg, filter_cfg, field_count, tx).await;
+        }
+        (Some(bind_addr), None) if transport == "udp" => {
+            let sock = UdpSocket::bind(bind_addr)
+                .await
+                .with_context(|| format!("syslog udp bind {}", bind_addr))?;
+            let mut buf = vec![0u8; 65_535];
+            let mut state = FilterState::default();
+            loop {
+                let (len, _) = sock.recv_from(&mut buf).await?;
+                let s = std::str::from_utf8(&buf[..len]).unwrap_or("");
+                let s = s.trim_end_matches(['\r', '\n']);
+                if s.is_empty() {
+                    continue;
+                }
+                handle_one_syslog_line(s, cfg, filter_cfg, field_count, &mut state, &tx)?;
             }
         }
-        _ => Err(anyhow!("unsupported transport: {}", cfg.transport)),
+        (None, Some(addr)) if transport == "udp" => {
+            let sock = UdpSocket::bind("0.0.0.0:0")
+                .await
+                .context("syslog udp ephemeral bind")?;
+            sock.connect(addr)
+                .await
+                .with_context(|| format!("syslog udp connect {}", addr))?;
+            let mut buf = vec![0u8; 65_535];
+            let mut state = FilterState::default();
+            loop {
+                let len = sock.recv(&mut buf).await?;
+                let s = std::str::from_utf8(&buf[..len]).unwrap_or("");
+                let s = s.trim_end_matches(['\r', '\n']);
+                if s.is_empty() {
+                    continue;
+                }
+                handle_one_syslog_line(s, cfg, filter_cfg, field_count, &mut state, &tx)?;
+            }
+        }
+        _ => {
+            return Err(anyhow!(
+                "syslog: set exactly one of listen_address or connect_address; transport must be tcp or udp"
+            ));
+        }
     }
+    #[allow(unreachable_code)]
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{parse_rfc3164_header_time_ns, parse_rfc5424_header_time_ns};
 
     #[test]
-    fn test_parse_rfc5424() {
-        // Standard RFC 5424 message
-        let msg = "<34>1 2003-10-11T22:14:15.003Z mymachine.example.com su - ID47 - \"message\"";
-        let (ts, payload) = parse_rfc5424(msg).unwrap();
-        assert!(ts.is_some());
-        assert!(payload.contains("message"));
+    fn rfc5424_header_timestamp_parses() {
+        let line = "<34>1 2024-06-01T12:34:56.789Z host app - - test";
+        let ns = parse_rfc5424_header_time_ns(line);
+        assert!(ns.is_some());
     }
 
     #[test]
-    fn test_parse_rfc3164() {
-        // Standard RFC 3164 message
-        let msg = "<34>Oct 11 22:14:15 mymachine su: message here";
-        let (ts, payload) = parse_rfc3164(msg).unwrap();
-        assert!(ts.is_some());
-        assert_eq!(payload, "message here");
-    }
-
-    #[test]
-    fn test_parse_syslog_timestamp_rfc5424() {
-        let ts = "2003-10-11T22:14:15.003Z";
-        let ns = parse_syslog_timestamp(ts);
-        assert!(ns > 0);
-    }
-
-    #[test]
-    fn test_json_path_extraction() {
-        let json = r#"{"price": 100.5, "volume": 500}"#;
-        let paths = vec!["price".to_string(), "volume".to_string()];
-        let (ts, metrics) = extract_metrics_from_json(json, &paths).unwrap();
-        assert_eq!(metrics.len(), 2);
-        assert!((metrics[0] - 100.5).abs() < 0.001);
-        assert!((metrics[1] - 500.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_json_path_nested() {
-        let json = r#"{"data": {"value": 42.5}}"#;
-        let val = json_path_get_f64(
-            &serde_json::from_str(json).unwrap(),
-            "data.value",
-        );
-        assert!(val.is_some());
-        assert!((val.unwrap() - 42.5).abs() < 0.001);
+    fn rfc3164_header_timestamp_parses() {
+        let line = "<34>Jan 15 10:00:00 myhost tag: hello";
+        let ns = parse_rfc3164_header_time_ns(line, 2026);
+        assert!(ns.is_some());
     }
 }

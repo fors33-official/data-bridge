@@ -121,9 +121,15 @@ Look in the `out/` directory:
 
 Each accepted row includes a `chain_hash` for tamper-evident verification.
 
-## Pre-Configured Templates (New in 0.4.0)
+## Pre-Configured Templates (0.4.0 samples / 0.5.0 generator)
 
-Skip the wizard entirely with ready-to-use templates in `config/`:
+Canonical connector stubs live under **`config/templates/`** (embedded at build time). Emit one with:
+
+```powershell
+cargo run --release --features full_engine -- generate --connector kraken-websocket --out config\from_template.toml
+```
+
+Skip the wizard entirely with ready-to-use **sample** TOMLs under `config/`:
 
 **WebSocket Connectors:**
 - `kraken_websocket.toml` - Kraken crypto exchange (pre-filled: wss://ws.kraken.com/v2)

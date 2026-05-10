@@ -4,30 +4,21 @@
 //! Custom provider: Use provider="custom" with JSONPath field extraction
 //! All output DataPoint { timestamp_ns, metrics: Vec<f64> } for the filter pipeline.
 
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use tokio::time::{sleep, Duration};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::time::{Duration, sleep};
+use tokio_tungstenite::{
+    Connector, connect_async, connect_async_tls_with_config,
+    tungstenite::Message,
+    tungstenite::client::IntoClientRequest,
+    tungstenite::http::{HeaderName, HeaderValue},
+};
 
-use crate::{now_unix_ms, DataPoint, FilterCfg, FilterState};
-
-/// Provider-specific WebSocket endpoint constants
-/// These are the standard endpoints for known providers - no auto-detection
-#[allow(dead_code)] // Constants available for future use and reference
-pub const KRAKEN_PUBLIC_URL: &str = "wss://ws.kraken.com/v2";
-#[allow(dead_code)] // Constants available for future use and reference
-pub const KRAKEN_AUTH_URL: &str = "wss://ws-auth.kraken.com/v2";
-#[allow(dead_code)] // Constants available for future use and reference
-pub const BINANCE_SPOT_URL: &str = "wss://stream.binance.com:9443/ws/";
-#[allow(dead_code)] // Constants available for future use and reference
-pub const BINANCE_FUTURES_URL: &str = "wss://fstream.binance.com/ws/";
-#[allow(dead_code)] // Constants available for future use and reference
-pub const ALCHEMY_MAINNET_URL: &str = "wss://eth-mainnet.g.alchemy.com/v2/";
-#[allow(dead_code)] // Constants available for future use and reference
-pub const INFURA_MAINNET_URL: &str = "wss://mainnet.infura.io/ws/v3/";
+use crate::tls_verifier;
+use crate::{DataPoint, FilterCfg, FilterState, now_unix_ms};
 
 /// Provider-specific config. Only fields for the selected provider are used.
 #[derive(Debug, Clone)]
@@ -46,8 +37,77 @@ pub struct WebSocketCfg {
     pub timestamp_path: Option<String>,
     /// Delay in seconds before reconnect after disconnect (default 10)
     pub reconnect_delay_secs: u64,
-    /// Resolved handshake headers (placeholders substituted in main).
-    pub headers: HashMap<String, String>,
+    /// Bearer token populated at runtime by the
+    /// `FORS33_SECRET_CONNECTOR__WEBSOCKET__TOKEN` env overlay. When present
+    /// it is sent as `Authorization: Bearer <token>` on the upgrade request.
+    pub token: Option<String>,
+    /// API key populated by `FORS33_SECRET_CONNECTOR__WEBSOCKET__API_KEY`. When
+    /// present it is sent as `X-Api-Key: <api_key>` on the upgrade request.
+    pub api_key: Option<String>,
+    /// Custom HTTP upgrade headers. Auth-bearing values may use
+    /// `${FORS33_SECRET_HEADER_<n>}` placeholders that the bridge env overlay
+    /// expands at TOML load time.
+    pub headers: Vec<HeaderKv>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HeaderKv {
+    pub key: String,
+    pub value: String,
+}
+
+/// Build the WebSocket upgrade `Request` with auth-bearing headers attached.
+/// Auth fields are populated by the `FORS33_SECRET_CONNECTOR__WEBSOCKET__*`
+/// env overlay; this helper never logs or persists secret values.
+pub(crate) fn build_ws_upgrade_request(
+    url: &str,
+    cfg: &WebSocketCfg,
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+    let mut request = url.into_client_request()?;
+    if let Some(t) = cfg.token.as_deref() {
+        let t = t.trim();
+        if !t.is_empty() {
+            let v = format!("Bearer {}", t);
+            if let Ok(hv) = HeaderValue::from_str(&v) {
+                request
+                    .headers_mut()
+                    .insert(HeaderName::from_static("authorization"), hv);
+            }
+        }
+    }
+    if let Some(k) = cfg.api_key.as_deref() {
+        let k = k.trim();
+        if !k.is_empty() {
+            if let Ok(hv) = HeaderValue::from_str(k) {
+                request
+                    .headers_mut()
+                    .insert(HeaderName::from_static("x-api-key"), hv);
+            }
+        }
+    }
+    for h in cfg.headers.iter() {
+        let key = h.key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        // Fail-fast on unresolved `${FORS33_SECRET_*}` placeholders. Returning
+        // the error here propagates up the WebSocket connector and out of the
+        // `tokio::spawn` future, which terminates the t3thr process non-zero.
+        let expanded = crate::utils::expand_fors33_secret_placeholders(h.value.trim())
+            .with_context(|| format!("WebSocket header {:?} placeholder expansion failed", key))?;
+        let expanded = expanded.trim();
+        if expanded.is_empty() {
+            continue;
+        }
+        let key_lc = key.to_ascii_lowercase();
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(key_lc.as_bytes()),
+            HeaderValue::from_str(expanded),
+        ) {
+            request.headers_mut().insert(name, val);
+        }
+    }
+    Ok(request)
 }
 
 fn hex_to_u64(s: &str) -> Option<u64> {
@@ -82,15 +142,26 @@ fn parse_kraken_message(data: &serde_json::Value) -> Option<DataPoint> {
         return None;
     }
     let obj = trades[0].as_object()?;
-    let price: f64 = obj.get("price")?.as_str()?.parse().ok().filter(|p| *p > 0.0)?;
-    let qty: f64 = obj.get("qty").or_else(|| obj.get("quantity"))
+    let price: f64 = obj
+        .get("price")?
+        .as_str()?
+        .parse()
+        .ok()
+        .filter(|p| *p > 0.0)?;
+    let qty: f64 = obj
+        .get("qty")
+        .or_else(|| obj.get("quantity"))
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
     if qty <= 0.0 {
         return None;
     }
-    Some(DataPoint::from_legacy(now_unix_ms() * 1_000_000, price, qty))
+    Some(DataPoint::from_legacy(
+        now_unix_ms() * 1_000_000,
+        price,
+        qty,
+    ))
 }
 
 // --- Alchemy / Infura (JSON-RPC eth_subscribe) ---
@@ -119,16 +190,27 @@ fn parse_ethereum_block_header(result: &serde_json::Value) -> Option<DataPoint> 
         .and_then(|v| v.as_str())
         .and_then(hex_to_f64)
         .unwrap_or(gas_used);
-    Some(DataPoint::from_legacy(timestamp * 1_000_000_000, price, gas_used))
+    Some(DataPoint::from_legacy(
+        timestamp * 1_000_000_000,
+        price,
+        gas_used,
+    ))
 }
 
 // Alchemy/Infura blockchain provider - pending transactions
 fn parse_ethereum_pending_tx(result: &serde_json::Value) -> Option<DataPoint> {
     let gas_price_hex = result.get("gasPrice")?.as_str()?;
-    let gas_hex = result.get("gas").and_then(|v| v.as_str()).unwrap_or("0x5208");
+    let gas_hex = result
+        .get("gas")
+        .and_then(|v| v.as_str())
+        .unwrap_or("0x5208");
     let price = hex_to_f64(gas_price_hex)?;
     let volume = hex_to_f64(gas_hex).unwrap_or(21000.0);
-    Some(DataPoint::from_legacy(now_unix_ms() * 1_000_000, price, volume))
+    Some(DataPoint::from_legacy(
+        now_unix_ms() * 1_000_000,
+        price,
+        volume,
+    ))
 }
 
 // --- Binance ---
@@ -139,7 +221,10 @@ fn parse_binance_message(data: &serde_json::Value) -> Option<DataPoint> {
     }
     let price: f64 = data.get("p")?.as_str()?.parse().ok().filter(|p| *p > 0.0)?;
     let qty: f64 = data.get("q")?.as_str()?.parse().ok().filter(|q| *q > 0.0)?;
-    let ts_ms: u64 = data.get("E").and_then(|v| v.as_u64()).unwrap_or_else(now_unix_ms);
+    let ts_ms: u64 = data
+        .get("E")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(now_unix_ms);
     Some(DataPoint::from_legacy(ts_ms * 1_000_000, price, qty))
 }
 
@@ -151,13 +236,13 @@ fn parse_custom_message(
     timestamp_path: Option<&str>,
 ) -> Option<DataPoint> {
     let mut metrics = Vec::with_capacity(field_paths.len());
-    
+
     // Extract metrics using JSONPath
     for path in field_paths {
         let value = json_path_get(data, path)?;
         metrics.push(value);
     }
-    
+
     // Extract timestamp if provided, otherwise use current time
     let timestamp_ns = if let Some(ts_path) = timestamp_path {
         let ts_value = json_path_get(data, ts_path)?;
@@ -165,8 +250,11 @@ fn parse_custom_message(
     } else {
         now_unix_ms() * 1_000_000
     };
-    
-    Some(DataPoint { timestamp_ns, metrics })
+
+    Some(DataPoint {
+        timestamp_ns,
+        metrics,
+    })
 }
 
 /// Simple JSONPath getter using dot notation
@@ -174,7 +262,7 @@ fn parse_custom_message(
 fn json_path_get(value: &serde_json::Value, path: &str) -> Option<f64> {
     let parts: Vec<&str> = path.split('.').collect();
     let mut current = value;
-    
+
     for part in parts {
         // Check if this is an array index
         if let Ok(idx) = part.parse::<usize>() {
@@ -183,7 +271,7 @@ fn json_path_get(value: &serde_json::Value, path: &str) -> Option<f64> {
             current = current.get(part)?;
         }
     }
-    
+
     // Convert to f64
     match current {
         serde_json::Value::Number(n) => n.as_f64(),
@@ -196,7 +284,7 @@ fn json_path_get(value: &serde_json::Value, path: &str) -> Option<f64> {
 pub async fn run_websocket_connector(
     cfg: &WebSocketCfg,
     filter_cfg: &FilterCfg,
-    tx: SyncSender<Result<DataPoint, (String, String)>>,
+    tx: SyncSender<Result<DataPoint, (String, String, Option<u64>)>>,
 ) -> Result<()> {
     let reconnect_delay = Duration::from_secs(cfg.reconnect_delay_secs.max(1));
 
@@ -207,7 +295,7 @@ pub async fn run_websocket_connector(
     {
         let dummy = DataPoint::from_legacy(now_unix_ms() * 1_000_000, 1.0, 1.0);
         if tx.send(Ok(dummy)).is_err() {
-            eprintln!("[Fors33] FATAL: Writer channel closed. Stopping websocket connector.");
+            eprintln!("[FORS33] FATAL: Writer channel closed. Stopping websocket connector.");
             std::process::exit(1);
         }
     }
@@ -216,7 +304,10 @@ pub async fn run_websocket_connector(
         let url = match resolve_url(cfg) {
             Ok(u) => u,
             Err(e) => {
-                eprintln!("[BRIDGE] WebSocket config error: {}, reconnecting in {:?}...", e, reconnect_delay);
+                eprintln!(
+                    "[BRIDGE] WebSocket config error: {}, reconnecting in {:?}...",
+                    e, reconnect_delay
+                );
                 sleep(reconnect_delay).await;
                 continue;
             }
@@ -224,7 +315,10 @@ pub async fn run_websocket_connector(
 
         match connect_and_run(cfg, filter_cfg, &tx, &url).await {
             Ok(()) => {
-                eprintln!("[BRIDGE] WebSocket stream closed, reconnecting in {:?}...", reconnect_delay);
+                eprintln!(
+                    "[BRIDGE] WebSocket stream closed, reconnecting in {:?}...",
+                    reconnect_delay
+                );
             }
             Err(e) => {
                 eprintln!(
@@ -240,35 +334,33 @@ pub async fn run_websocket_connector(
 async fn connect_and_run(
     cfg: &WebSocketCfg,
     filter_cfg: &FilterCfg,
-    tx: &SyncSender<Result<DataPoint, (String, String)>>,
+    tx: &SyncSender<Result<DataPoint, (String, String, Option<u64>)>>,
     url: &str,
 ) -> Result<()> {
-    let (ws_stream, _) = if cfg.headers.is_empty() {
-        connect_async(url).await?
+    // Build an HTTP upgrade request so we can attach Authorization/X-Api-Key
+    // and any custom headers. Auth fields are populated by the
+    // `FORS33_SECRET_CONNECTOR__WEBSOCKET__*` env overlay at TOML load time;
+    // the connector code itself never sees plaintext tokens unless they are
+    // already in memory.
+    let request = build_ws_upgrade_request(url, cfg)?;
+
+    // TLS observability: for `wss://` URLs, hand the handshake a rustls config
+    // whose certificate verifier delegates to `WebPkiVerifier` and emits a
+    // `[T3thr:CONNECTION_META]` line through the shared `tls_meta` module on
+    // every successful handshake. For `ws://` we keep the plain path so we
+    // never silently upgrade an explicit cleartext URL.
+    let url_lower = url.to_ascii_lowercase();
+    let (ws_stream, _) = if url_lower.starts_with("wss://") {
+        let rustls_cfg = Arc::new(tls_verifier::observing_client_config());
+        let connector = Connector::Rustls(rustls_cfg);
+        connect_async_tls_with_config(request, None, false, Some(connector)).await?
     } else {
-        use tokio_tungstenite::tungstenite::http::{Request, Uri};
-        let uri: Uri = url
-            .parse()
-            .map_err(|e| anyhow!("invalid WebSocket URL: {e}"))?;
-        let host = uri
-            .host()
-            .ok_or_else(|| anyhow!("WebSocket URL missing host"))?;
-        let mut req_builder = Request::builder()
-            .method("GET")
-            .uri(&uri)
-            .header("Host", host);
-        for (k, v) in &cfg.headers {
-            req_builder = req_builder.header(k, v);
-        }
-        let request = req_builder
-            .body(())
-            .map_err(|e| anyhow!("failed building WebSocket request: {e}"))?;
         connect_async(request).await?
     };
     if cfg!(feature = "dev_license_bypass")
         && std::env::var("T3THR_TEST_LOG_CONNECT").ok().as_deref() == Some("1")
     {
-        eprintln!("[Fors33] TEST: WebSocket connected: {url}");
+        eprintln!("[FORS33] TEST: WebSocket connected: {url}");
     }
     let (mut write, mut read) = ws_stream.split();
 
@@ -290,7 +382,12 @@ async fn connect_and_run(
                 write.send(Message::Text(sub)).await?;
             }
         }
-        _ => return Err(anyhow::anyhow!("Unknown WebSocket provider: {}", cfg.provider)),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Unknown WebSocket provider: {}",
+                cfg.provider
+            ));
+        }
     }
 
     let mut state = FilterState::default();
@@ -307,10 +404,12 @@ async fn connect_and_run(
             Ok(d) => d,
             Err(e) => {
                 if tx
-                    .send(Err((format!("Parse Error: {}", e), text.clone())))
+                    .send(Err((format!("Parse Error: {}", e), text.clone(), None)))
                     .is_err()
                 {
-                    eprintln!("[Fors33] FATAL: Writer channel closed. Stopping websocket connector.");
+                    eprintln!(
+                        "[FORS33] FATAL: Writer channel closed. Stopping websocket connector."
+                    );
                     std::process::exit(1);
                 }
                 continue;
@@ -350,7 +449,10 @@ async fn connect_and_run(
                 parse_custom_message(&data, field_paths, cfg.timestamp_path.as_deref())
             }
             _ => {
-                eprintln!("Unknown provider: {}. Supported: kraken, alchemy, infura, binance, custom", provider);
+                eprintln!(
+                    "Unknown provider: {}. Supported: kraken, alchemy, infura, binance, custom",
+                    provider
+                );
                 continue;
             }
         };
@@ -363,13 +465,20 @@ async fn connect_and_run(
         match state.check(&tick, filter_cfg) {
             Ok(()) => {
                 if tx.send(Ok(tick)).is_err() {
-                    eprintln!("[Fors33] FATAL: Writer channel closed. Stopping websocket connector.");
+                    eprintln!(
+                        "[FORS33] FATAL: Writer channel closed. Stopping websocket connector."
+                    );
                     std::process::exit(1);
                 }
             }
             Err(reason) => {
-                if tx.send(Err((reason, text.clone()))).is_err() {
-                    eprintln!("[Fors33] FATAL: Writer channel closed. Stopping websocket connector.");
+                if tx
+                    .send(Err((reason, text.clone(), Some(tick.timestamp_ns))))
+                    .is_err()
+                {
+                    eprintln!(
+                        "[FORS33] FATAL: Writer channel closed. Stopping websocket connector."
+                    );
                     std::process::exit(1);
                 }
             }
@@ -390,10 +499,84 @@ fn resolve_url(cfg: &WebSocketCfg) -> Result<String> {
                 let stream = cfg.stream.as_deref().unwrap_or("btcusdt@trade");
                 Ok(format!("wss://stream.binance.com:9443/ws/{}", stream))
             }
-            _ => Err(anyhow::anyhow!("WebSocket url required for provider {}", cfg.provider)),
+            _ => Err(anyhow::anyhow!(
+                "WebSocket url required for provider {}",
+                cfg.provider
+            )),
         }
     } else {
         Ok(url.to_string())
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_cfg(url: &str) -> WebSocketCfg {
+        WebSocketCfg {
+            url: url.to_string(),
+            provider: "custom".to_string(),
+            symbol: None,
+            subscription: None,
+            stream: None,
+            field_paths: None,
+            timestamp_path: None,
+            reconnect_delay_secs: 10,
+            token: None,
+            api_key: None,
+            headers: vec![],
+        }
+    }
+
+    #[test]
+    fn build_ws_upgrade_request_attaches_authorization_header() {
+        let mut cfg = empty_cfg("wss://example.com/ws");
+        cfg.token = Some("abc123".to_string());
+        let req = build_ws_upgrade_request(&cfg.url, &cfg).unwrap();
+        assert_eq!(req.headers().get("authorization").unwrap(), "Bearer abc123");
+    }
+
+    #[test]
+    fn build_ws_upgrade_request_attaches_api_key_header() {
+        let mut cfg = empty_cfg("wss://example.com/ws");
+        cfg.api_key = Some("k-xyz".to_string());
+        let req = build_ws_upgrade_request(&cfg.url, &cfg).unwrap();
+        assert_eq!(req.headers().get("x-api-key").unwrap(), "k-xyz");
+    }
+
+    #[test]
+    fn build_ws_upgrade_request_merges_custom_headers() {
+        let mut cfg = empty_cfg("wss://example.com/ws");
+        cfg.headers = vec![HeaderKv {
+            key: "X-Trace".to_string(),
+            value: "1".to_string(),
+        }];
+        let req = build_ws_upgrade_request(&cfg.url, &cfg).unwrap();
+        assert_eq!(req.headers().get("x-trace").unwrap(), "1");
+    }
+
+    #[test]
+    fn build_ws_upgrade_request_skips_empty_fields() {
+        let mut cfg = empty_cfg("wss://example.com/ws");
+        cfg.token = Some("   ".to_string());
+        cfg.api_key = Some("".to_string());
+        let req = build_ws_upgrade_request(&cfg.url, &cfg).unwrap();
+        assert!(req.headers().get("authorization").is_none());
+        assert!(req.headers().get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn build_ws_upgrade_request_fails_when_placeholder_unresolved() {
+        unsafe {
+            std::env::remove_var("FORS33_SECRET_HEADER_WS_TEST_MISSING");
+        }
+        let mut cfg = empty_cfg("wss://example.com/ws");
+        cfg.headers = vec![HeaderKv {
+            key: "Authorization".to_string(),
+            value: "Bearer ${FORS33_SECRET_HEADER_WS_TEST_MISSING}".to_string(),
+        }];
+        let res = build_ws_upgrade_request(&cfg.url, &cfg);
+        assert!(res.is_err(), "unresolved placeholder must propagate error");
+    }
+}

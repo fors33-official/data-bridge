@@ -17,21 +17,19 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    let exe = option_env!("CARGO_BIN_EXE_t3thr").map(PathBuf::from).unwrap_or_else(|| {
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.push("target");
-        p.push(if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
+    let exe = option_env!("CARGO_BIN_EXE_t3thr")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("target");
+            p.push(if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            });
+            p.push(if cfg!(windows) { "t3thr.exe" } else { "t3thr" });
+            p
         });
-        p.push(if cfg!(windows) {
-            "t3thr.exe"
-        } else {
-            "t3thr"
-        });
-        p
-    });
 
     if !exe.exists() {
         eprintln!(
