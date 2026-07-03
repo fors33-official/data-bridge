@@ -7,8 +7,7 @@ This guide helps non-technical users set up and run Fors33 T3thr in under 5 minu
 T3thr is a tool that:
 - Reads data from files, APIs, or live streams
 - Checks data quality (filters out bad/anomalous values)
-- Saves clean data to output files
-- Adds tamper-evident cryptographic verification
+- Saves clean data to output files in CSV or JSONL format
 
 **No programming required.** Everything is configured through simple text files.
 
@@ -37,18 +36,24 @@ You can also run the bridge from a single Docker image.
 ```bash
 docker run \
   -v "$(pwd)/config:/app/config" \
+  -v "$(pwd)/data:/app/out" \
   fors33/data-bridge \
   --config /app/config/default.toml
 ```
+
+The image bundles **`examples/sample_input.csv`** when you do not mount a custom examples directory. Point **`output.accepted_path`** and **`output.dead_letter_path`** at paths under **`/app/out`** when using the output volume above.
 
 - **Windows (PowerShell), free File/CSV tier:**
 
 ```powershell
 docker run `
   -v ${PWD}/config:/app/config `
+  -v ${PWD}/data:/app/out `
   fors33/data-bridge `
   --config /app/config/default.toml
 ```
+
+The image bundles **`examples/sample_input.csv`** when you do not mount a custom examples directory. Point output paths under **`/app/out`** when using the output volume above.
 
 Live connectors (WebSocket / REST / Message Bus / gRPC) require a valid `FORS33_LICENSE_KEY`. Example:
 
@@ -57,7 +62,17 @@ docker run \
   -e FORS33_LICENSE_KEY="your_key" \
   -v "$(pwd)/config:/app/config" \
   fors33/data-bridge \
-  --config /app/config/live_example.toml
+  generate --connector rest-polling > config/live_rest.toml
+```
+
+Then run with the generated config (set `T3THR_*` env vars for secrets as documented in the template).
+
+```bash
+docker run \
+  -e FORS33_LICENSE_KEY="your_key" \
+  -v "$(pwd)/config:/app/config" \
+  fors33/data-bridge \
+  --config /app/config/live_rest.toml
 ```
 
 If the key is missing or invalid, the container exits with a clear message explaining that live streaming requires an active subscription and how to supply `FORS33_LICENSE_KEY`.
@@ -117,9 +132,7 @@ cargo run --release -- --config config/your_config.toml
 
 Look in the `out/` directory:
 - `*_accepted.csv` - Clean, validated data
-- `*_rejected.csv` - Bad data with rejection reasons
-
-Each accepted row includes a `chain_hash` for tamper-evident verification.
+- `*_rejected.csv` or `dead_letter.jsonl` - Rejected records with reasons
 
 ## Pre-Configured Templates (0.4.0 samples / 0.5.0 generator)
 
@@ -372,9 +385,7 @@ cargo run --release --features full_engine -- --config config/your_config.toml
 
 **Replay Mode:** Skip timestamp checks for historical data
 
-**Chain Hash:** Cryptographic proof of data integrity (tamper-evident)
-
 ---
 
-**That's it!** You now have a working data pipeline with automatic quality filtering and cryptographic verification.
+**That's it!** You now have a working data pipeline with automatic quality filtering and deterministic outputs.
 

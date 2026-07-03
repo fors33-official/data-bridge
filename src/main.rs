@@ -2,6 +2,7 @@
 // Use of this software is governed by the FORS33 End User License Agreement.
 // Unauthorized reproduction, distribution, or reverse engineering is strictly prohibited.
 
+mod batch_limits;
 mod commands;
 #[cfg(feature = "full_engine")]
 mod connector_cdc_mysql;
@@ -28,7 +29,7 @@ use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{NaiveDateTime, TimeZone, Utc};
@@ -51,11 +52,25 @@ fn default_chronological_anchor() -> ChronologicalAnchor {
     ChronologicalAnchor::PayloadNative
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct ExecutionCfgTbl {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    max_records: Option<u64>,
+    #[serde(default)]
+    max_duration_sec: Option<u64>,
+    #[serde(default)]
+    max_pages: Option<usize>,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct BridgeConfig {
     #[serde(default = "default_chronological_anchor")]
     pub(crate) chronological_anchor: ChronologicalAnchor,
     pub(crate) connector: ConnectorCfg,
+    #[serde(default)]
+    execution: Option<ExecutionCfgTbl>,
     pub(crate) normalizer: NormalizerCfg,
     pub(crate) filter: FilterCfg,
     pub(crate) output: OutputCfg,
@@ -76,6 +91,34 @@ fn default_channel_capacity() -> usize {
 }
 
 impl BridgeConfig {
+    pub(crate) fn is_batch_connector(&self) -> bool {
+        if self.connector.mode.as_deref() == Some("batch") {
+            return true;
+        }
+        self.execution
+            .as_ref()
+            .and_then(|e| e.mode.as_deref())
+            == Some("batch")
+    }
+
+    pub(crate) fn execution_limits(&self) -> batch_limits::ExecutionLimits {
+        let exec = self.execution.as_ref();
+        batch_limits::ExecutionLimits {
+            max_records: exec.and_then(|e| e.max_records),
+            max_duration_sec: exec.and_then(|e| e.max_duration_sec),
+            max_pages: exec
+                .and_then(|e| e.max_pages)
+                .or_else(|| self.connector.rest.as_ref().and_then(|r| r.page_limit)),
+        }
+    }
+
+    fn writer_batch_stop(&self, accepted: u64, started: Instant) -> Option<&'static str> {
+        if !self.is_batch_connector() {
+            return None;
+        }
+        self.execution_limits().check_writer(accepted, started)
+    }
+
     /// Translate legacy config fields into N-dimensional equivalents at load time.
     /// Emits a single [DEPRECATION] warning when legacy keys are normalized.
     pub fn normalize_and_validate(&mut self) {
@@ -452,12 +495,18 @@ struct WebSocketCfgUnified {
     token: Option<String>,
     #[serde(default)]
     api_key: Option<String>,
+    #[serde(default)]
+    api_secret: Option<String>,
+    #[serde(default)]
+    rpc_poll_interval_ms: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_header_kv_vec")]
     headers: Vec<HeaderKv>,
     #[serde(default)]
     env_headers: HashMap<String, String>,
     #[serde(default = "default_reconnect_delay")]
     reconnect_delay_secs: u64,
+    #[serde(default)]
+    channels: Option<Vec<String>>,
 }
 
 fn default_reconnect_delay() -> u64 {
@@ -851,6 +900,15 @@ pub(crate) struct OutputCfg {
     /// `none` (single file `{prefix}.{ext}`) or `daily` (UTC `{prefix}_YYYY-MM-DD.{ext}`).
     #[serde(default)]
     pub(crate) rotation: Option<String>,
+    /// Per-feed file prefix when `output_dir` + `rotation` apply (websocket multi-channel).
+    #[serde(default)]
+    pub(crate) accepted_prefix_by_feed: Option<HashMap<String, String>>,
+    /// Per-feed explicit accepted paths (no rotation; websocket dry-run / non-attest split).
+    #[serde(default)]
+    pub(crate) accepted_path_by_feed: Option<HashMap<String, String>>,
+    /// When true, accepted JSONL rows omit `feed` (one file per channel).
+    #[serde(default)]
+    pub(crate) channel_scoped_accepted: bool,
 }
 
 impl OutputCfg {
@@ -912,6 +970,30 @@ impl OutputCfg {
         }
     }
 
+    fn resolve_rotated_path(
+        dir: &str,
+        prefix: &str,
+        rotation: &str,
+        ext: &str,
+        utc_date: Option<&str>,
+    ) -> Result<PathBuf> {
+        let rot = rotation.trim().to_lowercase();
+        if rot == "daily" {
+            let d = utc_date
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
+            Ok(PathBuf::from(dir).join(format!("{prefix}_{d}.{ext}")))
+        } else if rot == "none" {
+            Ok(PathBuf::from(dir).join(format!("{prefix}.{ext}")))
+        } else {
+            Err(anyhow!(
+                "output.rotation must be 'none' or 'daily' (got {rot})"
+            ))
+        }
+    }
+
     /// Resolved accepted output path. When `utc_date` is `Some`, used for `daily` rotation shard name (YYYY-MM-DD UTC).
     pub(crate) fn resolved_accepted_path_utc(&self, utc_date: Option<&str>) -> Result<PathBuf> {
         let dir_o = self
@@ -930,23 +1012,8 @@ impl OutputCfg {
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .unwrap_or("none")
-                .to_lowercase();
-            let ext = self.format_extension();
-            if rot == "daily" {
-                let d = utc_date
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
-                Ok(PathBuf::from(dir).join(format!("{prefix}_{d}.{ext}")))
-            } else if rot == "none" {
-                Ok(PathBuf::from(dir).join(format!("{prefix}.{ext}")))
-            } else {
-                Err(anyhow!(
-                    "output.rotation must be 'none' or 'daily' (got {rot})"
-                ))
-            }
+                .unwrap_or("none");
+            Self::resolve_rotated_path(dir, prefix, rot, self.format_extension(), utc_date)
         } else if !self.accepted_path.trim().is_empty() {
             Ok(PathBuf::from(self.accepted_path.trim()))
         } else {
@@ -954,6 +1021,26 @@ impl OutputCfg {
                 "output.accepted_path is required unless output_dir and file_prefix are set"
             ))
         }
+    }
+
+    pub(crate) fn resolved_accepted_path_for_prefix(
+        &self,
+        prefix: &str,
+        utc_date: Option<&str>,
+    ) -> Result<PathBuf> {
+        let dir_o = self
+            .output_dir
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("output_dir required for per-feed accepted paths"))?;
+        let rot = self
+            .rotation
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("none");
+        Self::resolve_rotated_path(dir_o, prefix.trim(), rot, self.format_extension(), utc_date)
     }
 
     pub(crate) fn is_daily_rotation(&self) -> bool {
@@ -986,19 +1073,31 @@ enum AcceptedFormat {
     // Parquet will be added for file/batch modes in a later step.
 }
 
+struct FeedWriterState {
+    accepted: AcceptedFormat,
+    headers_written: bool,
+    last_shard_utc_day: String,
+    active_accepted_path: PathBuf,
+    /// Set when this writer uses per-feed prefix rotation (not explicit path map).
+    rotate_prefix: Option<String>,
+}
+
+enum DataSinkMode {
+    Single(FeedWriterState),
+    Multi(HashMap<String, FeedWriterState>),
+}
+
 /// Unified sink for accepted and dead-letter outputs.
 ///
 /// - Ensures headers are written once for CSV.
 /// - Writes dead-letter records as flat JSONL regardless of accepted format.
 pub struct DataSink {
-    accepted: AcceptedFormat,
+    mode: DataSinkMode,
     dead_letter: File,
-    headers_written: bool,
     field_count: usize,
     output_cfg: OutputCfg,
     rotating_daily: bool,
-    last_shard_utc_day: String,
-    active_accepted_path: PathBuf,
+    channel_scoped: bool,
 }
 
 impl DataSink {
@@ -1027,104 +1126,42 @@ impl DataSink {
         }
     }
 
-    pub(crate) fn new(cfg: &BridgeConfig, field_count: usize) -> Result<Self> {
-        let accepted_path = cfg.output.resolved_accepted_path_utc(None)?;
-        let dead_path = PathBuf::from(&cfg.output.dead_letter_path);
-
-        ensure_parent(&accepted_path)?;
-        ensure_parent(&dead_path)?;
-
-        let format_lower = cfg.output.format.to_lowercase();
-        let accepted = Self::open_accepted_handle(&accepted_path, &format_lower)?;
-
-        let dead_file = File::create(&dead_path).with_context(|| {
-            format!("failed opening dead-letter output {}", dead_path.display())
-        })?;
-
-        let rotating_daily = cfg.output.is_daily_rotation();
+    fn open_feed_writer(
+        output_cfg: &OutputCfg,
+        field_count: usize,
+        accepted_path: &Path,
+        rotate_prefix: Option<String>,
+        rotating_daily: bool,
+    ) -> Result<FeedWriterState> {
+        ensure_parent(accepted_path)?;
+        let format_lower = output_cfg.format.to_lowercase();
+        let accepted = Self::open_accepted_handle(accepted_path, &format_lower)?;
         let last_shard_utc_day = if rotating_daily {
             Utc::now().format("%Y-%m-%d").to_string()
         } else {
             String::new()
         };
-
-        let mut sink = Self {
+        let mut writer = FeedWriterState {
             accepted,
-            dead_letter: dead_file,
             headers_written: false,
-            field_count,
-            output_cfg: cfg.output.clone(),
-            rotating_daily,
             last_shard_utc_day,
-            active_accepted_path: accepted_path.clone(),
+            active_accepted_path: accepted_path.to_path_buf(),
+            rotate_prefix,
         };
-
-        // If the accepted file already exists and is non-empty, validate schema.
         if accepted_path.exists() {
-            let metadata = std::fs::metadata(&accepted_path).with_context(|| {
+            let metadata = std::fs::metadata(accepted_path).with_context(|| {
                 format!("failed reading metadata for {}", accepted_path.display())
             })?;
-            if metadata.len() > 0 {
-                // Header validation only for CSV (JSONL has no header row).
-                if format_lower != "jsonl" && format_lower != "canonical_jsonl" {
-                    if let Some(first_line) = utils::read_first_nonempty_line(&accepted_path)? {
-                        let existing: Vec<String> = first_line
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .collect();
-                        let expected = cfg.output.get_headers(field_count);
-                        if existing != expected {
-                            return Err(anyhow!(
-                                "Header mismatch in accepted file.\n  existing: {:?}\n  expected: {:?}",
-                                existing,
-                                expected
-                            ));
-                        }
-                        sink.headers_written = true;
-                    }
-                }
-            }
-        }
-
-        Ok(sink)
-    }
-
-    fn rotate_accepted_if_needed(&mut self) -> Result<()> {
-        if !self.rotating_daily {
-            return Ok(());
-        }
-        let today = Utc::now().format("%Y-%m-%d").to_string();
-        if today == self.last_shard_utc_day {
-            return Ok(());
-        }
-        let new_path = self.output_cfg.resolved_accepted_path_utc(Some(&today))?;
-        if new_path == self.active_accepted_path {
-            self.last_shard_utc_day = today;
-            return Ok(());
-        }
-        ensure_parent(&new_path)?;
-        let format_lower = self.output_cfg.format.to_lowercase();
-        self.accepted = Self::open_accepted_handle(&new_path, &format_lower)?;
-        self.headers_written = false;
-        self.active_accepted_path = new_path;
-        self.last_shard_utc_day = today;
-
-        if self.active_accepted_path.exists() {
-            let metadata = std::fs::metadata(&self.active_accepted_path).with_context(|| {
-                format!(
-                    "failed reading metadata for {}",
-                    self.active_accepted_path.display()
-                )
-            })?;
-            if metadata.len() > 0 && format_lower != "jsonl" && format_lower != "canonical_jsonl" {
-                if let Some(first_line) =
-                    utils::read_first_nonempty_line(&self.active_accepted_path)?
-                {
+            if metadata.len() > 0
+                && format_lower != "jsonl"
+                && format_lower != "canonical_jsonl"
+            {
+                if let Some(first_line) = utils::read_first_nonempty_line(accepted_path)? {
                     let existing: Vec<String> = first_line
                         .split(',')
                         .map(|s| s.trim().to_string())
                         .collect();
-                    let expected = self.output_cfg.get_headers(self.field_count);
+                    let expected = output_cfg.get_headers(field_count);
                     if existing != expected {
                         return Err(anyhow!(
                             "Header mismatch in accepted file.\n  existing: {:?}\n  expected: {:?}",
@@ -1132,22 +1169,168 @@ impl DataSink {
                             expected
                         ));
                     }
-                    self.headers_written = true;
+                    writer.headers_written = true;
                 }
             }
         }
+        Ok(writer)
+    }
+
+    pub(crate) fn new(cfg: &BridgeConfig, field_count: usize) -> Result<Self> {
+        let dead_path = PathBuf::from(&cfg.output.dead_letter_path);
+        ensure_parent(&dead_path)?;
+        let dead_file = File::create(&dead_path).with_context(|| {
+            format!("failed opening dead-letter output {}", dead_path.display())
+        })?;
+        let rotating_daily = cfg.output.is_daily_rotation();
+        let channel_scoped = cfg.output.channel_scoped_accepted;
+
+        let mode = if let Some(prefix_map) = cfg.output.accepted_prefix_by_feed.as_ref() {
+            if !prefix_map.is_empty() {
+                let mut writers = HashMap::new();
+                for (feed, prefix) in prefix_map {
+                    let path = cfg
+                        .output
+                        .resolved_accepted_path_for_prefix(prefix, None)?;
+                    let w = Self::open_feed_writer(
+                        &cfg.output,
+                        field_count,
+                        &path,
+                        Some(prefix.clone()),
+                        rotating_daily,
+                    )?;
+                    writers.insert(feed.clone(), w);
+                }
+                DataSinkMode::Multi(writers)
+            } else if let Some(path_map) = cfg.output.accepted_path_by_feed.as_ref() {
+                if path_map.is_empty() {
+                    let accepted_path = cfg.output.resolved_accepted_path_utc(None)?;
+                    let w = Self::open_feed_writer(
+                        &cfg.output,
+                        field_count,
+                        &accepted_path,
+                        None,
+                        rotating_daily,
+                    )?;
+                    DataSinkMode::Single(w)
+                } else {
+                    let mut writers = HashMap::new();
+                    for (feed, path) in path_map {
+                        let p = PathBuf::from(path.trim());
+                        let w =
+                            Self::open_feed_writer(&cfg.output, field_count, &p, None, false)?;
+                        writers.insert(feed.clone(), w);
+                    }
+                    DataSinkMode::Multi(writers)
+                }
+            } else {
+                let accepted_path = cfg.output.resolved_accepted_path_utc(None)?;
+                let w = Self::open_feed_writer(
+                    &cfg.output,
+                    field_count,
+                    &accepted_path,
+                    None,
+                    rotating_daily,
+                )?;
+                DataSinkMode::Single(w)
+            }
+        } else if let Some(path_map) = cfg.output.accepted_path_by_feed.as_ref() {
+            if !path_map.is_empty() {
+                let mut writers = HashMap::new();
+                for (feed, path) in path_map {
+                    let p = PathBuf::from(path.trim());
+                    let w = Self::open_feed_writer(&cfg.output, field_count, &p, None, false)?;
+                    writers.insert(feed.clone(), w);
+                }
+                DataSinkMode::Multi(writers)
+            } else {
+                let accepted_path = cfg.output.resolved_accepted_path_utc(None)?;
+                let w = Self::open_feed_writer(
+                    &cfg.output,
+                    field_count,
+                    &accepted_path,
+                    None,
+                    rotating_daily,
+                )?;
+                DataSinkMode::Single(w)
+            }
+        } else {
+            let accepted_path = cfg.output.resolved_accepted_path_utc(None)?;
+            let w = Self::open_feed_writer(
+                &cfg.output,
+                field_count,
+                &accepted_path,
+                None,
+                rotating_daily,
+            )?;
+            DataSinkMode::Single(w)
+        };
+
+        Ok(Self {
+            mode,
+            dead_letter: dead_file,
+            field_count,
+            output_cfg: cfg.output.clone(),
+            rotating_daily,
+            channel_scoped,
+        })
+    }
+
+    fn rotate_feed_if_needed(
+        output_cfg: &OutputCfg,
+        rotating_daily: bool,
+        writer: &mut FeedWriterState,
+    ) -> Result<()> {
+        if !rotating_daily {
+            return Ok(());
+        }
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        if today == writer.last_shard_utc_day {
+            return Ok(());
+        }
+        let new_path = if let Some(prefix) = writer.rotate_prefix.as_deref() {
+            output_cfg.resolved_accepted_path_for_prefix(prefix, Some(&today))?
+        } else {
+            output_cfg.resolved_accepted_path_utc(Some(&today))?
+        };
+        if new_path == writer.active_accepted_path {
+            writer.last_shard_utc_day = today;
+            return Ok(());
+        }
+        let format_lower = output_cfg.format.to_lowercase();
+        writer.accepted = Self::open_accepted_handle(&new_path, &format_lower)?;
+        writer.headers_written = false;
+        writer.active_accepted_path = new_path;
+        writer.last_shard_utc_day = today;
         Ok(())
     }
 
     /// Write an accepted DataPoint.
     pub fn write_accepted(&mut self, point: &DataPoint) -> Result<()> {
-        self.rotate_accepted_if_needed()?;
-        match self.accepted {
-            AcceptedFormat::Csv(ref mut w) => {
-                if !self.headers_written {
-                    let headers = self.output_cfg.get_headers(self.field_count);
+        let include_feed = !self.channel_scoped;
+        let output_cfg = &self.output_cfg;
+        let rotating_daily = self.rotating_daily;
+        let field_count = self.field_count;
+        let writer = match &mut self.mode {
+            DataSinkMode::Single(w) => w,
+            DataSinkMode::Multi(map) => {
+                let feed = point
+                    .feed
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow!("missing feed for multi-channel accepted write"))?;
+                map.get_mut(feed).ok_or_else(|| {
+                    anyhow!("unknown feed {:?} for accepted write", feed)
+                })?
+            }
+        };
+        Self::rotate_feed_if_needed(output_cfg, rotating_daily, writer)?;
+        match &mut writer.accepted {
+            AcceptedFormat::Csv(w) => {
+                if !writer.headers_written {
+                    let headers = output_cfg.get_headers(field_count);
                     w.write_record(&headers)?;
-                    self.headers_written = true;
+                    writer.headers_written = true;
                 }
                 let mut row = Vec::with_capacity(2 + point.metrics.len());
                 row.push(point.timestamp_ns.to_string());
@@ -1157,12 +1340,22 @@ impl DataSink {
                 w.write_record(&row)?;
                 Ok(())
             }
-            AcceptedFormat::Jsonl(ref mut f) => {
+            AcceptedFormat::Jsonl(f) => {
                 let mut obj = serde_json::Map::new();
                 obj.insert(
                     "timestamp_ns".to_string(),
                     serde_json::Value::Number(serde_json::Number::from(point.timestamp_ns)),
                 );
+                if include_feed {
+                    if let Some(feed) = point.feed.as_deref() {
+                        if !feed.is_empty() {
+                            obj.insert(
+                                "feed".to_string(),
+                                serde_json::Value::String(feed.to_string()),
+                            );
+                        }
+                    }
+                }
                 for (idx, m) in point.metrics.iter().enumerate() {
                     let key = format!("metric_{}", idx);
                     obj.insert(
@@ -1177,11 +1370,8 @@ impl DataSink {
                 f.write_all(b"\n")?;
                 Ok(())
             }
-            AcceptedFormat::CanonicalJsonl(ref mut f) => {
-                // Deterministic JSON text:
-                // - key order fixed: timestamp_ns, then metric_<i> in Vec index order
-                // - floats formatted via ryu (round-trip shortest form)
-                let line = canonical_jsonl_line(point)?;
+            AcceptedFormat::CanonicalJsonl(f) => {
+                let line = canonical_jsonl_line(point, include_feed)?;
                 f.write_all(line.as_bytes())?;
                 Ok(())
             }
@@ -1225,6 +1415,8 @@ impl DataSink {
 pub struct DataPoint {
     pub(crate) timestamp_ns: u64,
     pub(crate) metrics: Vec<f64>,
+    /// Venue channel or stream name when multiplexing WebSocket feeds into one accepted.jsonl.
+    pub(crate) feed: Option<String>,
 }
 
 impl DataPoint {
@@ -1233,6 +1425,7 @@ impl DataPoint {
         Self {
             timestamp_ns,
             metrics: Vec::with_capacity(capacity),
+            feed: None,
         }
     }
 
@@ -1241,6 +1434,15 @@ impl DataPoint {
         Self {
             timestamp_ns,
             metrics: vec![price, volume],
+            feed: None,
+        }
+    }
+
+    pub fn with_feed(timestamp_ns: u64, metrics: Vec<f64>, feed: &str) -> Self {
+        Self {
+            timestamp_ns,
+            metrics,
+            feed: Some(feed.to_string()),
         }
     }
 
@@ -1250,7 +1452,7 @@ impl DataPoint {
     }
 }
 
-fn canonical_jsonl_line(point: &DataPoint) -> Result<String> {
+pub(crate) fn canonical_jsonl_line(point: &DataPoint, include_feed: bool) -> Result<String> {
     if point.metrics.iter().any(|m| !m.is_finite()) {
         return Err(anyhow!(
             "non-finite metric in canonical_jsonl accepted record"
@@ -1259,6 +1461,14 @@ fn canonical_jsonl_line(point: &DataPoint) -> Result<String> {
     let mut out = String::with_capacity(64 + (point.metrics.len() * 24));
     out.push_str("{\"timestamp_ns\":");
     out.push_str(&point.timestamp_ns.to_string());
+    if include_feed {
+        if let Some(feed) = point.feed.as_deref() {
+            if !feed.is_empty() {
+                out.push_str(",\"feed\":");
+                out.push_str(&serde_json::to_string(feed)?);
+            }
+        }
+    }
     let mut buf = Buffer::new();
     for (idx, m) in point.metrics.iter().enumerate() {
         out.push_str(",\"metric_");
@@ -1561,6 +1771,7 @@ fn parse_data_point(
     Ok(DataPoint {
         timestamp_ns,
         metrics,
+        feed: None,
     })
 }
 
@@ -1627,7 +1838,14 @@ fn run_csv_mode(cfg: &BridgeConfig) -> Result<()> {
     // Note: The csv crate can be overly strict about field counts. We catch errors
     // and route to dead-letter queue per spec: "Extra fields are simply ignored"
     let records_iter = reader.records();
+    let batch_started = Instant::now();
     for row in records_iter {
+        if let Some(reason) =
+            cfg.writer_batch_stop(accepted_ctr.load(AtomicOrdering::Relaxed) as u64, batch_started)
+        {
+            batch_limits::emit_batch_complete(reason);
+            break;
+        }
         let record = match row {
             Ok(r) => r,
             Err(e) => {
@@ -1718,6 +1936,8 @@ fn run_websocket_mode(cfg: &BridgeConfig) -> Result<()> {
         reconnect_delay_secs: w.reconnect_delay_secs,
         token: w.token.clone(),
         api_key: w.api_key.clone(),
+        api_secret: w.api_secret.clone(),
+        rpc_poll_interval_ms: w.rpc_poll_interval_ms,
         headers: w
             .headers
             .iter()
@@ -1726,6 +1946,7 @@ fn run_websocket_mode(cfg: &BridgeConfig) -> Result<()> {
                 value: h.value.clone(),
             })
             .collect(),
+        channels: w.channels.clone(),
     };
 
     let field_count = cfg.normalizer.get_field_count();
@@ -1738,11 +1959,13 @@ fn run_websocket_mode(cfg: &BridgeConfig) -> Result<()> {
     let filter_cfg = cfg.filter.clone();
     let pipe_path = cfg.output.pipe_path.clone();
 
+    let is_batch = cfg.is_batch_connector();
     let rt = tokio::runtime::Runtime::new()?;
     let conn_handle = std::thread::spawn(move || {
         rt.block_on(async {
             if let Err(e) =
-                connector_websocket::run_websocket_connector(&ws_cfg, &filter_cfg, tx).await
+                connector_websocket::run_websocket_connector(&ws_cfg, &filter_cfg, tx, is_batch)
+                    .await
             {
                 eprintln!("[BRIDGE] WebSocket connector error: {}", e);
             }
@@ -1806,7 +2029,14 @@ fn run_websocket_mode(cfg: &BridgeConfig) -> Result<()> {
         }
     });
 
+    let batch_started = Instant::now();
     for msg in rx {
+        if let Some(reason) =
+            cfg.writer_batch_stop(accepted_ctr.load(AtomicOrdering::Relaxed) as u64, batch_started)
+        {
+            batch_limits::emit_batch_complete(reason);
+            break;
+        }
         match msg {
             Ok(point) => {
                 accepted_ctr.fetch_add(1, AtomicOrdering::Relaxed);
@@ -1897,6 +2127,7 @@ fn run_rest_mode(cfg: &BridgeConfig, state_path: Option<&Path>) -> Result<()> {
     let output_cfg = cfg.output.clone();
     let state_path_clone = state_path.map(|p| p.to_path_buf());
 
+    let exec_limits = cfg.execution_limits();
     let _conn_handle = std::thread::spawn(move || {
         if let Err(e) = connector_rest::run_rest_connector(
             &rest_cfg,
@@ -1904,6 +2135,7 @@ fn run_rest_mode(cfg: &BridgeConfig, state_path: Option<&Path>) -> Result<()> {
             &output_cfg,
             tx,
             state_path_clone.as_deref(),
+            &exec_limits,
         ) {
             eprintln!("[BRIDGE] REST connector error: {}", e);
         }
@@ -1948,7 +2180,14 @@ fn run_rest_mode(cfg: &BridgeConfig, state_path: Option<&Path>) -> Result<()> {
         }
     });
 
+    let batch_started = Instant::now();
     for msg in rx {
+        if let Some(reason) =
+            cfg.writer_batch_stop(accepted_ctr.load(AtomicOrdering::Relaxed) as u64, batch_started)
+        {
+            batch_limits::emit_batch_complete(reason);
+            break;
+        }
         match msg {
             Ok(tick) => {
                 accepted_ctr.fetch_add(1, AtomicOrdering::Relaxed);
@@ -2120,7 +2359,14 @@ fn run_message_bus_mode(cfg: &BridgeConfig) -> Result<()> {
         }
     });
 
+    let batch_started = Instant::now();
     for msg in rx {
+        if let Some(reason) =
+            cfg.writer_batch_stop(accepted_ctr.load(AtomicOrdering::Relaxed) as u64, batch_started)
+        {
+            batch_limits::emit_batch_complete(reason);
+            break;
+        }
         match msg {
             Ok(tick) => {
                 accepted_ctr.fetch_add(1, AtomicOrdering::Relaxed);
@@ -2246,7 +2492,14 @@ fn run_grpc_mode(cfg: &BridgeConfig) -> Result<()> {
         }
     });
 
+    let batch_started = Instant::now();
     for msg in rx {
+        if let Some(reason) =
+            cfg.writer_batch_stop(accepted_ctr.load(AtomicOrdering::Relaxed) as u64, batch_started)
+        {
+            batch_limits::emit_batch_complete(reason);
+            break;
+        }
         match msg {
             Ok(tick) => {
                 accepted_ctr.fetch_add(1, AtomicOrdering::Relaxed);
@@ -2355,7 +2608,14 @@ fn run_syslog_mode(cfg: &BridgeConfig) -> Result<()> {
             );
         }
     });
+    let batch_started = Instant::now();
     for msg in rx {
+        if let Some(reason) =
+            cfg.writer_batch_stop(accepted_ctr.load(AtomicOrdering::Relaxed) as u64, batch_started)
+        {
+            batch_limits::emit_batch_complete(reason);
+            break;
+        }
         match msg {
             Ok(tick) => {
                 accepted_ctr.fetch_add(1, AtomicOrdering::Relaxed);
@@ -2466,7 +2726,14 @@ fn run_udp_raw_mode(cfg: &BridgeConfig) -> Result<()> {
             );
         }
     });
+    let batch_started = Instant::now();
     for msg in rx {
+        if let Some(reason) =
+            cfg.writer_batch_stop(accepted_ctr.load(AtomicOrdering::Relaxed) as u64, batch_started)
+        {
+            batch_limits::emit_batch_complete(reason);
+            break;
+        }
         match msg {
             Ok(tick) => {
                 accepted_ctr.fetch_add(1, AtomicOrdering::Relaxed);
@@ -2536,6 +2803,7 @@ fn run_cdc_postgres_mode(cfg: &BridgeConfig) -> Result<()> {
         publication_name: c.publication_name.clone(),
         field_paths: paths,
         timestamp_path: c.timestamp_path.clone(),
+        resume_lsn: c.resume_lsn.clone(),
     };
     let field_count = cfg.normalizer.get_field_count();
     let mut sink = DataSink::new(cfg, field_count)?;
@@ -2589,7 +2857,14 @@ fn run_cdc_postgres_mode(cfg: &BridgeConfig) -> Result<()> {
             );
         }
     });
+    let batch_started = Instant::now();
     for msg in rx {
+        if let Some(reason) =
+            cfg.writer_batch_stop(accepted_ctr.load(AtomicOrdering::Relaxed) as u64, batch_started)
+        {
+            batch_limits::emit_batch_complete(reason);
+            break;
+        }
         match msg {
             Ok(tick) => {
                 accepted_ctr.fetch_add(1, AtomicOrdering::Relaxed);
@@ -2726,7 +3001,14 @@ fn run_cdc_mysql_mode(cfg: &BridgeConfig) -> Result<()> {
             );
         }
     });
+    let batch_started = Instant::now();
     for msg in rx {
+        if let Some(reason) =
+            cfg.writer_batch_stop(accepted_ctr.load(AtomicOrdering::Relaxed) as u64, batch_started)
+        {
+            batch_limits::emit_batch_complete(reason);
+            break;
+        }
         match msg {
             Ok(tick) => {
                 accepted_ctr.fetch_add(1, AtomicOrdering::Relaxed);
@@ -3084,7 +3366,7 @@ pub(crate) fn execute_run(args: &commands::RunArgs) -> Result<()> {
     }
 
     // Determine if this is a batch job (exits after completion) or stream job (runs indefinitely)
-    let is_batch = cfg.connector.mode.as_deref() == Some("batch");
+    let is_batch = cfg.is_batch_connector();
 
     // State tracking for batch mode resume capability
     let state_path = if is_batch && !cli.no_state {
@@ -3196,14 +3478,37 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{DataPoint, canonical_jsonl_line};
+    use std::fs;
+    use std::path::PathBuf;
+
+    struct TmpDir {
+        _guard: tempfile::TempDir,
+    }
+
+    impl TmpDir {
+        fn new() -> Self {
+            Self {
+                _guard: tempfile::tempdir().expect("temp dir"),
+            }
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self._guard.path().join(name)
+        }
+    }
+
+    fn toml_path(path: &std::path::Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
 
     #[test]
     fn canonical_jsonl_is_deterministic_and_ordered() {
         let p = DataPoint {
             timestamp_ns: 42,
             metrics: vec![1.25, 2.0, 3.5],
+            feed: None,
         };
-        let line = canonical_jsonl_line(&p).expect("canonical line");
+        let line = canonical_jsonl_line(&p, true).expect("canonical line");
         assert_eq!(
             line,
             "{\"timestamp_ns\":42,\"metric_0\":1.25,\"metric_1\":2.0,\"metric_2\":3.5}\n"
@@ -3211,12 +3516,191 @@ mod tests {
     }
 
     #[test]
+    fn canonical_jsonl_emits_feed_when_set() {
+        let p = DataPoint::with_feed(99, vec![1.0, 2.0], "trade");
+        let line = canonical_jsonl_line(&p, true).expect("canonical line");
+        assert_eq!(
+            line,
+            "{\"timestamp_ns\":99,\"feed\":\"trade\",\"metric_0\":1.0,\"metric_1\":2.0}\n"
+        );
+    }
+
+    #[test]
+    fn canonical_jsonl_omits_feed_when_channel_scoped() {
+        let p = DataPoint::with_feed(7, vec![1.0, 2.0], "trade");
+        let line = canonical_jsonl_line(&p, false).expect("canonical line");
+        assert_eq!(line, "{\"timestamp_ns\":7,\"metric_0\":1.0,\"metric_1\":2.0}\n");
+    }
+
+    #[test]
+    fn data_sink_multi_feed_writes_separate_channel_scoped_files() {
+        let tmp = TmpDir::new();
+        let scratch = tmp.join("multi-feed-dir");
+        let base = scratch.parent().expect("parent");
+        let input = base.join("input.csv");
+        fs::write(&input, "ts,price,volume\n").expect("input");
+        let trade_path = base.join("accepted.trade.jsonl");
+        let ticker_path = base.join("accepted.ticker.jsonl");
+        let dead_path = base.join("dead_letter.jsonl");
+        let toml_src = format!(
+            r#"
+[connector]
+type = "file"
+
+[connector.file]
+input_path = "{}"
+format = "csv"
+has_headers = true
+mode = "stream"
+
+[normalizer]
+field_count = 2
+
+[filter]
+reject_nan_inf = true
+replay_mode = true
+drop_on_parse_error = true
+fail_fast = true
+future_tolerance_ms = 60000
+stale_tolerance_ms = 300000
+
+[output]
+format = "canonical_jsonl"
+accepted_path = "{}"
+dead_letter_path = "{}"
+channel_scoped_accepted = true
+
+[output.accepted_path_by_feed]
+trade = "{}"
+ticker = "{}"
+"#,
+            toml_path(&input),
+            toml_path(&trade_path),
+            toml_path(&dead_path),
+            toml_path(&trade_path),
+            toml_path(&ticker_path),
+        );
+        let mut cfg: super::BridgeConfig = toml::from_str(&toml_src).expect("toml parse");
+        cfg.output.accepted_path = toml_path(&trade_path);
+        cfg.output.dead_letter_path = toml_path(&dead_path);
+        let mut sink = super::DataSink::new(&cfg, 2).expect("sink");
+        sink.write_accepted(&DataPoint::with_feed(1, vec![10.0, 1.0], "trade"))
+            .expect("trade write");
+        sink.write_accepted(&DataPoint::with_feed(2, vec![20.0, 2.0], "ticker"))
+            .expect("ticker write");
+        let trade_body = fs::read_to_string(&trade_path).expect("trade file");
+        let ticker_body = fs::read_to_string(&ticker_path).expect("ticker file");
+        assert!(trade_body.contains("\"metric_0\":10.0"));
+        assert!(!trade_body.contains("\"feed\""));
+        assert!(ticker_body.contains("\"metric_0\":20.0"));
+        assert!(!ticker_body.contains("\"feed\""));
+    }
+
+    #[test]
+    fn jsonl_write_accepted_emits_feed_when_set() {
+        let tmp = TmpDir::new();
+        let accepted = tmp.join("accepted.jsonl");
+        let dead = tmp.join("dead.jsonl");
+        let toml_src = format!(
+            r#"
+[connector.csv]
+input_path = "unused.csv"
+has_headers = true
+
+[normalizer]
+field_count = 2
+
+[filter]
+reject_nan_inf = true
+replay_mode = true
+drop_on_parse_error = true
+fail_fast = true
+future_tolerance_ms = 60000
+stale_tolerance_ms = 300000
+
+[output]
+format = "jsonl"
+accepted_path = "{}"
+dead_letter_path = "{}"
+"#,
+            toml_path(&accepted),
+            toml_path(&dead),
+        );
+        let cfg: super::BridgeConfig = toml::from_str(&toml_src).expect("toml parse");
+        let mut sink = super::DataSink::new(&cfg, 2).expect("sink");
+        sink.write_accepted(&DataPoint::with_feed(5, vec![1.5, 2.5], "ticks"))
+            .expect("write");
+        let body = fs::read_to_string(&accepted).expect("accepted");
+        assert!(body.contains("\"feed\":\"ticks\""));
+        assert!(body.contains("\"metric_0\":1.5"));
+    }
+
+    #[test]
+    fn csv_mode_honors_execution_max_records() {
+        let tmp = TmpDir::new();
+        let input = tmp.join("input.csv");
+        let accepted = tmp.join("accepted.csv");
+        let dead = tmp.join("dead.jsonl");
+        fs::write(
+            &input,
+            "timestamp_ns,price,volume\n1000,10,1\n2000,20,2\n3000,30,3\n4000,40,4\n5000,50,5\n",
+        )
+        .expect("input");
+        let toml_src = format!(
+            r#"
+[connector.csv]
+input_path = "{}"
+has_headers = true
+
+[normalizer]
+field_count = 2
+field_map = {{ price = 0, volume = 1 }}
+timestamp_field = "timestamp_ns"
+timestamp_unit = "ns"
+
+[filter]
+reject_nan_inf = true
+replay_mode = true
+drop_on_parse_error = true
+fail_fast = true
+future_tolerance_ms = 60000
+stale_tolerance_ms = 300000
+
+[filter.bounds]
+metric_0.min = 0.0
+metric_0.max = 1.0e12
+metric_1.min = 0.0
+metric_1.max = 1.0e12
+
+[output]
+accepted_path = "{}"
+dead_letter_path = "{}"
+format = "csv"
+
+[execution]
+mode = "batch"
+max_records = 2
+"#,
+            toml_path(&input),
+            toml_path(&accepted),
+            toml_path(&dead),
+        );
+        let mut cfg: super::BridgeConfig = toml::from_str(&toml_src).expect("toml parse");
+        cfg.normalize_and_validate();
+        super::run_csv_mode(&cfg).expect("csv run");
+        let body = fs::read_to_string(&accepted).expect("accepted");
+        let data_lines: Vec<_> = body.lines().skip(1).collect();
+        assert_eq!(data_lines.len(), 2, "expected max_records cap at 2 accepted rows");
+    }
+
+    #[test]
     fn canonical_jsonl_rejects_non_finite() {
         let p = DataPoint {
             timestamp_ns: 42,
             metrics: vec![1.25, f64::NAN],
+            feed: None,
         };
-        let err = canonical_jsonl_line(&p).expect_err("non-finite must fail");
+        let err = canonical_jsonl_line(&p, true).expect_err("non-finite must fail");
         assert!(err.to_string().contains("non-finite"));
     }
 

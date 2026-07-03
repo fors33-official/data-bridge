@@ -32,12 +32,13 @@
 # Internal-only reference material (must never ship public)
 /reference/
 
-# Internal documentation (entire folder is maintainer-only)
-/docs/
+# Internal documentation (maintainer-only; public release notes are tracked)
+/docs/*
+!/docs/bridge-release-notes-*.md
 
 # Cursor workspace (internal)
 /.cursor/
-.cursorignore
+# .cursorignore is tracked for contributor hygiene
 
 # OS
 .DS_Store

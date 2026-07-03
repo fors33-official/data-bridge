@@ -1,8 +1,8 @@
 # Fors33 T3thr
 
 [![CI](https://img.shields.io/github/actions/workflow/status/fors33-official/data-bridge/release.yml?branch=main&style=flat-square)](https://github.com/fors33-official/data-bridge/actions)
-[![Release](https://img.shields.io/badge/release-0.5.0-blue?style=flat-square)](https://github.com/fors33-official/data-bridge/releases)
-[![Docker Tag](https://img.shields.io/badge/docker-0.5.0%20%7C%20latest-2496ED?style=flat-square&logo=docker&logoColor=white)](https://hub.docker.com/r/fors33/data-bridge)
+[![Release](https://img.shields.io/badge/release-0.6.0-blue?style=flat-square)](https://github.com/fors33-official/data-bridge/releases)
+[![Docker Tag](https://img.shields.io/badge/docker-0.6.0%20%7C%20latest-2496ED?style=flat-square&logo=docker&logoColor=white)](https://hub.docker.com/r/fors33/data-bridge)
 [![Docker Pulls](https://img.shields.io/docker/pulls/fors33/data-bridge?style=flat-square)](https://hub.docker.com/r/fors33/data-bridge)
 [![License](https://img.shields.io/github/license/fors33-official/data-bridge?style=flat-square)](https://github.com/fors33-official/data-bridge/blob/main/LICENSE)
 
@@ -59,7 +59,7 @@ docker run --rm `
 You can also pull from GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/fors33-official/data-bridge:0.5.0
+docker pull ghcr.io/fors33-official/data-bridge:0.6.0
 docker pull ghcr.io/fors33-official/data-bridge:latest
 ```
 
@@ -85,9 +85,23 @@ docker run --rm \
 <summary><strong>Release notes (expand)</strong></summary>
 
 <details open>
+<summary>0.6.0 – Transport parity and batch caps</summary>
+
+- **Batch execution caps:** `[execution]` table (`max_records`, `max_duration_sec`, `max_pages`) with `[FORS33] batch complete` stderr signaling; caps apply to CSV/file batch loops and live connectors.
+- **Multi-feed outputs:** `accepted_path_by_feed`, `accepted_prefix_by_feed`, `channel_scoped_accepted` for per-channel accepted files.
+- **WebSocket:** `binance_futures`, `binance_ws_api`, HMAC signing, multi-channel Kraken; optional `feed` on accepted JSONL rows.
+- **Postgres CDC:** wal2json and pgoutput slot plugins; optional `resume_lsn`.
+- **Build and release:** `native_certs` feature gate for slim builds; CI validates Docker image before registry push; bundled `config/default.toml` and `examples/sample_input.csv`.
+- **Onboarding:** `TERMINOLOGY.md`; Docker Hub README sync on release workflow.
+- Semver synced in `Cargo.toml` and `pkg/Dockerfile` label at **0.6.0**.
+- See [`docs/bridge-release-notes-0.6.0.md`](docs/bridge-release-notes-0.6.0.md).
+
+</details>
+
+<details>
 <summary>0.5.0 – Extension Rust bridge parity (standalone)</summary>
 
-Summary: Rust stack matches the Fors33 Data Latch **extension bridge** (`t3thr_bridge`) for TLS observability (`[T3thr:CONNECTION_META]`), rustls-centric connectors, **`FORS33_SECRET_*`** placeholder expansion (additive next to **`T3THR_*`** env tables), nested Kafka/MQTT config, **`t3thr generate`** from embedded **`config/templates/`**, state file locking, Tokio **`block_in_place`** for file ingestion, unified subcommand CLI with **backward-compatible** bare **`--config`**, **`--validate-only`**, **`--config-wizard`**, and retained **`validate_config`** / **`migrate_config`** binaries. Published images now include **`config_wizard`**, **`validate_config`**, and **`migrate_config`** under `/usr/local/bin/`.
+Summary: Standalone Rust stack matches the **L3dgr** embedded T3thr transport layer for TLS observability (`[T3thr:CONNECTION_META]`), rustls-centric connectors, **`FORS33_SECRET_*`** placeholder expansion (additive next to **`T3THR_*`** env tables), nested Kafka/MQTT config, **`t3thr generate`** from embedded **`config/templates/`**, state file locking, Tokio **`block_in_place`** for file ingestion, unified subcommand CLI with **backward-compatible** bare **`--config`**, **`--validate-only`**, **`--config-wizard`**, and retained **`validate_config`** / **`migrate_config`** binaries. Published images now include **`config_wizard`**, **`validate_config`**, and **`migrate_config`** under `/usr/local/bin/`.
 
 Technical note: **`config`** crate merges **`FORS33_SECRET`** with `__` separators after loading the file (see [`docs/bridge-release-notes-0.5.0.md`](docs/bridge-release-notes-0.5.0.md)).
 
@@ -129,8 +143,8 @@ The default **slim** build supports **file**, **CSV**, and **REST**; **full_engi
 
 ## Documentation
 
-- [`docs/bridge-release-notes-0.5.0.md`](docs/bridge-release-notes-0.5.0.md)
-- `docs/QUICK_START.md`
-- `pkg/README.md`
-- `docs/license_backend_contract.md`
+- [`docs/bridge-release-notes-0.6.0.md`](docs/bridge-release-notes-0.6.0.md)
+- [`QUICK_START.md`](QUICK_START.md)
+- [`TERMINOLOGY.md`](TERMINOLOGY.md)
+- [`pkg/README.md`](pkg/README.md)
 

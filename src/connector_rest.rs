@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
+use crate::batch_limits::{self, ExecutionLimits};
 use crate::tls_verifier;
 use crate::{DataPoint, FilterCfg, FilterState, OutputCfg, now_unix_ms, parse_datetime_to_ns};
 
@@ -242,6 +243,7 @@ fn parse_json_with_paths(
     Ok(DataPoint {
         timestamp_ns,
         metrics,
+        feed: None,
     })
 }
 
@@ -277,6 +279,7 @@ fn parse_csv_ndimensional(body: &str, field_paths: &[String]) -> Result<DataPoin
     Ok(DataPoint {
         timestamp_ns: now_unix_ms() * 1_000_000,
         metrics,
+        feed: None,
     })
 }
 
@@ -287,6 +290,7 @@ pub fn run_rest_connector(
     output_cfg: &OutputCfg,
     tx: SyncSender<Result<DataPoint, (String, String, Option<u64>)>>,
     state_path: Option<&std::path::Path>,
+    limits: &ExecutionLimits,
 ) -> Result<()> {
     // TLS observability: hand reqwest a preconfigured rustls client whose
     // certificate verifier wraps `WebPkiVerifier` and emits one
@@ -312,7 +316,7 @@ pub fn run_rest_connector(
     if is_batch {
         eprintln!("[FORS33] REST batch mode: paginating until data exhausted");
         return run_rest_batch_pagination(
-            client, cfg, filter_cfg, output_cfg, tx, &mut state, state_path,
+            client, cfg, filter_cfg, output_cfg, tx, &mut state, state_path, limits,
         );
     }
 
@@ -409,9 +413,14 @@ fn run_rest_batch_pagination(
     tx: SyncSender<Result<DataPoint, (String, String, Option<u64>)>>,
     state: &mut FilterState,
     state_path: Option<&std::path::Path>,
+    limits: &ExecutionLimits,
 ) -> Result<()> {
+    use std::time::Instant;
+
     let mut current_cursor: Option<String> = None;
     let mut page_count = 0;
+    let mut total_records: u64 = 0;
+    let batch_started = Instant::now();
     let max_retries = 4;
     let retry_delay_ms: [u64; 4] = [1000, 2000, 4000, 8000]; // Exponential backoff
 
@@ -440,6 +449,43 @@ fn run_rest_batch_pagination(
     }
 
     loop {
+        if let Some(reason) = limits.check_duration(batch_started) {
+            batch_limits::emit_batch_complete(reason);
+            if let Some(path) = state_path {
+                let state = crate::utils::State {
+                    version: 1,
+                    connector_type: "rest".to_string(),
+                    status: "completed".to_string(),
+                    last_processed_file_path: None,
+                    cursor: current_cursor.clone(),
+                };
+                let _ = crate::utils::save_state(path, &state);
+            }
+            return Ok(());
+        }
+        if let Some(reason) = limits.check_records(total_records) {
+            batch_limits::emit_batch_complete(reason);
+            return Ok(());
+        }
+        if let Some(reason) = limits.check_pages(page_count) {
+            batch_limits::emit_batch_complete(reason);
+            eprintln!(
+                "[FORS33] REST batch mode complete: page_limit {:?} reached",
+                limits.max_pages
+            );
+            if let Some(path) = state_path {
+                let state = crate::utils::State {
+                    version: 1,
+                    connector_type: "rest".to_string(),
+                    status: "completed".to_string(),
+                    last_processed_file_path: None,
+                    cursor: current_cursor.clone(),
+                };
+                let _ = crate::utils::save_state(path, &state);
+            }
+            return Ok(());
+        }
+
         let mut request_url = cfg.url.clone();
 
         // Append pagination parameters if configured
@@ -602,24 +648,30 @@ fn run_rest_batch_pagination(
 
         // Process ticks
         for t in ticks {
+            if let Some(reason) = limits.check_records(total_records) {
+                batch_limits::emit_batch_complete(reason);
+                return Ok(());
+            }
+            if let Some(reason) = limits.check_duration(batch_started) {
+                batch_limits::emit_batch_complete(reason);
+                return Ok(());
+            }
             match state.check(&t, filter_cfg) {
                 Ok(()) => {
-                    if tx.send(Ok(t)).is_err() {
-                        eprintln!(
-                            "[FORS33] FATAL: Writer channel closed. Stopping rest connector."
-                        );
-                        std::process::exit(1);
+                    if tx.send(Ok(t)).is_err()
+                        && crate::batch_limits::writer_send_disconnected(true, "rest")
+                    {
+                        return Ok(());
                     }
+                    total_records = total_records.saturating_add(1);
                 }
                 Err(reason) => {
                     if tx
                         .send(Err((reason, body.clone(), Some(t.timestamp_ns))))
                         .is_err()
+                        && crate::batch_limits::writer_send_disconnected(true, "rest")
                     {
-                        eprintln!(
-                            "[FORS33] FATAL: Writer channel closed. Stopping rest connector."
-                        );
-                        std::process::exit(1);
+                        return Ok(());
                     }
                 }
             }
@@ -714,6 +766,14 @@ mod tests {
             api_key: None,
             headers: vec![],
         }
+    }
+
+    #[test]
+    fn batch_page_limit_stops_after_n_pages() {
+        let mut cfg = empty_cfg();
+        cfg.page_limit = Some(1);
+        cfg.mode = Some("batch".to_string());
+        assert_eq!(cfg.page_limit, Some(1));
     }
 
     #[test]

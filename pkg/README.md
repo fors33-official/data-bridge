@@ -1,15 +1,15 @@
-## Docker image: Fors33 Data-bridge (main binary + compat helpers)
+## Docker image: T3thr (main binary + compat helpers)
 
 This directory contains packaging assets for the bridge image: primary entrypoint **`t3thr`**, plus **`config_wizard`**, **`validate_config`**, and **`migrate_config`** copied into `/usr/local/bin/` for legacy operator flows. **Free File/CSV tier** and **Pro live connectors** remain gated by `FORS33_LICENSE_KEY`.
 
 ### Build (multi-arch example)
 
-**Docker Hub tags:** use numeric semver only (e.g. `0.5.0`), not a `v` prefix, plus `latest`.
+**Docker Hub tags:** use numeric semver only (e.g. `0.6.0`), not a `v` prefix, plus `latest`.
 
 ```bash
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
-  -t fors33/data-bridge:0.5.0 \
+  -t fors33/data-bridge:0.6.0 \
   -t fors33/data-bridge:latest \
   -f pkg/Dockerfile \
   .
@@ -74,8 +74,9 @@ File and CSV connectors run **without any license key**:
 ```bash
 docker run \
   -v "$(pwd)/config:/app/config" \
+  -v "$(pwd)/data:/app/out" \
   fors33/data-bridge \
-  --config /app/config/file_example.toml
+  --config /app/config/default.toml
 ```
 
 ### Connector maps, `T3THR_*`, and `${FORS33_SECRET_*}` (0.5.0+)
@@ -93,7 +94,17 @@ docker run \
   -e FORS33_LICENSE_KEY="your_key" \
   -v "$(pwd)/config:/app/config" \
   fors33/data-bridge \
-  --config /app/config/live_example.toml
+  generate --connector kraken-websocket > config/live_kraken.toml
+```
+
+Set `FORS33_LICENSE_KEY` and any `T3THR_*` / `${FORS33_SECRET_*}` env vars required by the template, then:
+
+```bash
+docker run \
+  -e FORS33_LICENSE_KEY="your_key" \
+  -v "$(pwd)/config:/app/config" \
+  fors33/data-bridge \
+  --config /app/config/live_kraken.toml
 ```
 
 If the key is missing or invalid, the binary prints a **clinical**, non-technical message to `stderr` and exits with a non-zero code:

@@ -80,6 +80,7 @@ pub fn run_cdc_mysql_blocking(
                 let tick = DataPoint {
                     timestamp_ns: ts,
                     metrics: placeholder_metrics(field_count),
+                    feed: None,
                 };
                 match state.check(&tick, filter_cfg) {
                     Ok(()) => {

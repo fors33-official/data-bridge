@@ -99,6 +99,7 @@ fn parse_json_ndimensional(payload: &str, cfg: &MessageBusCfg) -> Result<DataPoi
     Ok(DataPoint {
         timestamp_ns,
         metrics,
+        feed: None,
     })
 }
 

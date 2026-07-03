@@ -25,3 +25,7 @@ drop_on_parse_error = true
 [output]
 accepted_path = "out/file_batch_accepted.csv"
 dead_letter_path = "out/file_batch_dead.csv"
+
+[execution]
+mode = "batch"
+max_records = 10000

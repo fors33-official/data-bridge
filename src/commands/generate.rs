@@ -1,7 +1,7 @@
 //! `t3thr generate` subcommand: emit a frictionless TOML template for the
 //! requested connector slug.
 //!
-//! Templates live under `t3thr_bridge/config/templates/*.toml` and are
+//! Templates live under `config/templates/*.toml` and are
 //! embedded via `include_str!` so the generator output is auditable in the
 //! source tree (no I/O at runtime, no version drift between binary and
 //! template files).

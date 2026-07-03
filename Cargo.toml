@@ -1,6 +1,6 @@
 [package]
 name = "t3thr"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 
 [dependencies]
@@ -17,6 +17,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ryu = "1"
 sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 walkdir = "2"
@@ -28,15 +30,15 @@ walkdir = "2"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "logging", "tls12"] }
 rustls-pki-types = "1"
 rustls-pemfile = "2"
-rustls-native-certs = "0.7"
+rustls-native-certs = { version = "0.7", optional = true }
 webpki-roots = "0.26"
 x509-parser = "0.16"
 
 # full_engine: Kafka/MQTT, WebSocket, gRPC, Parquet input
 arrow2 = { version = "0.18", features = ["io_parquet", "io_parquet_compression"], optional = true }
 futures-util = { version = "0.3", optional = true }
-rdkafka = { version = "0.36", features = ["cmake-build"], optional = true }
-rumqttc = { version = "0.25", optional = true }
+rdkafka = { version = "0.36", default-features = false, features = ["cmake-build", "tokio"], optional = true }
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"], optional = true }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"], optional = true }
 tonic = { version = "0.14", optional = true }
@@ -58,10 +60,15 @@ slim_engine = []
 dev_license_bypass = []
 # Docker / full product: all connectors + Parquet + gRPC protos.
 full_engine = [
-    "dep:arrow2",
-    "dep:futures-util",
+    "engine_connectors",
+    "native_certs",
     "dep:rdkafka",
     "dep:rumqttc",
+]
+native_certs = ["dep:rustls-native-certs"]
+engine_connectors = [
+    "dep:arrow2",
+    "dep:futures-util",
     "dep:tokio-tungstenite",
     "dep:tokio-rustls",
     "dep:tonic",
@@ -73,6 +80,9 @@ full_engine = [
     "dep:tokio-postgres-rustls",
     "dep:mysql",
 ]
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 strip = true

@@ -29,6 +29,7 @@ use crate::tls_meta;
 pub fn default_root_store() -> RootCertStore {
     let mut store = RootCertStore::empty();
 
+    #[cfg(feature = "native_certs")]
     if let Ok(certs) = rustls_native_certs::load_native_certs() {
         for c in certs {
             let _ = store.add(c);

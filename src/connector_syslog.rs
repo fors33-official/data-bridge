@@ -111,6 +111,7 @@ fn handle_one_syslog_line(
     let point = DataPoint {
         timestamp_ns: ts_ns,
         metrics: placeholder_metrics(field_count),
+        feed: None,
     };
     match state.check(&point, filter_cfg) {
         Ok(()) => {

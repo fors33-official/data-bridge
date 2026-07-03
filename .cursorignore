@@ -1,0 +1,11 @@
+**/env
+**/*.ini
+**/.ssh/
+reference/**
+config/v1_*.toml
+config/v2_dce_*.toml
+config/v2_binance_btc.toml
+config/v2_kraken_live.toml
+config/v2_binance_parquet.toml
+config/v3_*.toml
+config/qcr.toml

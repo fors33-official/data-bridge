@@ -185,6 +185,7 @@ pub async fn run_grpc_connector(
         let point = DataPoint {
             timestamp_ns,
             metrics: msg.metrics,
+            feed: None,
         };
         let raw = format!(
             "grpc_msg timestamp_ns={} metrics={:?}",

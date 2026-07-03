@@ -4,6 +4,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+use std::time::Instant;
 use walkdir::WalkDir;
 
 use anyhow::{Context, Result, anyhow};
@@ -16,7 +17,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    BridgeConfig, DataPoint, FilterState, NormalizerCfg, ensure_parent, now_unix_ms,
+    BridgeConfig, DataPoint, FilterState, NormalizerCfg, batch_limits, ensure_parent, now_unix_ms,
     parse_datetime_to_ns, parse_ts_to_ns,
 };
 
@@ -389,6 +390,7 @@ fn parse_csv_record(
     Ok(DataPoint {
         timestamp_ns,
         metrics,
+        feed: None,
     })
 }
 
@@ -462,6 +464,7 @@ fn parse_json_record(obj: &Value, ncfg: &NormalizerCfg) -> Result<DataPoint> {
     Ok(DataPoint {
         timestamp_ns,
         metrics,
+        feed: None,
     })
 }
 
@@ -1053,6 +1056,7 @@ fn run_parquet(
                 let point = DataPoint {
                     timestamp_ns,
                     metrics,
+                    feed: None,
                 };
 
                 let raw_record = format!("row_{}", row_offset + row);
@@ -1272,8 +1276,17 @@ where
     let mut accepted = 0usize;
     let mut dropped = 0usize;
     let mut processed = 0usize;
+    let batch_started = Instant::now();
 
     for record in records {
+        if cfg.is_batch_connector() {
+            if let Some(reason) =
+                cfg.execution_limits().check_writer(accepted as u64, batch_started)
+            {
+                batch_limits::emit_batch_complete(reason);
+                break;
+            }
+        }
         if processed != 0 && processed % YIELD_RECORDS == 0 {
             std::thread::yield_now();
         }

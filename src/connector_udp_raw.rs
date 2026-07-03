@@ -71,6 +71,7 @@ fn parse_datagram_json(payload: &str, cfg: &UdpRawCfg) -> Result<DataPoint> {
     Ok(DataPoint {
         timestamp_ns,
         metrics,
+        feed: None,
     })
 }
 

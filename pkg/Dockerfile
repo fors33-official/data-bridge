@@ -16,7 +16,7 @@ RUN cargo build --release $CARGO_BUILD_FLAGS
 
 FROM debian:13-slim
 
-LABEL org.opencontainers.image.version="0.5.0"
+LABEL org.opencontainers.image.version="0.6.0"
 
 RUN apt-get update && apt-get upgrade -y --no-install-recommends && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
@@ -27,6 +27,11 @@ COPY --from=builder /app/target/release/t3thr /usr/local/bin/t3thr
 COPY --from=builder /app/target/release/config_wizard /usr/local/bin/config_wizard
 COPY --from=builder /app/target/release/validate_config /usr/local/bin/validate_config
 COPY --from=builder /app/target/release/migrate_config /usr/local/bin/migrate_config
+COPY config/default.toml /app/config/default.toml
+COPY examples /app/examples
+RUN chown -R bridge:bridge /app/config /app/examples \
+    && mkdir -p /app/out \
+    && chown bridge:bridge /app/out
 
 USER bridge
 

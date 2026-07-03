@@ -21,7 +21,9 @@
 
 # Root config examples are mounted at runtime, not copied into the runtime image layers.
 # `config/templates/` must stay in the build context: `include_str!` in src/commands/generate.rs.
+# `config/default.toml` is bundled in the runtime image for Docker quick start.
 config/*
+!config/default.toml
 !config/templates/
 !config/templates/**
 
