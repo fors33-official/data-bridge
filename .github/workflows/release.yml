@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag (e.g., 0.6.0)'
+        description: 'Release version (e.g., v0.6.0; v prefix optional)'
         required: true
         type: string
       tag_latest:
@@ -45,13 +45,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify version matches Cargo.toml
+      - name: Resolve release version
+        id: ver
         run: |
+          RAW="${{ inputs.version }}"
+          VERSION="${RAW#v}"
           CARGO_VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          if [ "$CARGO_VER" != "${{ inputs.version }}" ]; then
-            echo "Cargo.toml version ($CARGO_VER) does not match workflow input (${{ inputs.version }})"
+          if [ "$CARGO_VER" != "$VERSION" ]; then
+            echo "Cargo.toml version ($CARGO_VER) does not match workflow input ($RAW → $VERSION)"
             exit 1
           fi
+          echo "Resolved release version: $VERSION (git tag: v${VERSION})"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -77,7 +82,7 @@ jobs:
           platforms: linux/amd64
           push: false
           load: true
-          tags: fors33/data-bridge:${{ inputs.version }}
+          tags: fors33/data-bridge:${{ steps.ver.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           sbom: true
@@ -85,12 +90,12 @@ jobs:
 
       - name: Validate image config
         run: |
-          docker run --rm fors33/data-bridge:${{ inputs.version }} \
+          docker run --rm fors33/data-bridge:${{ steps.ver.outputs.version }} \
             run --validate-only --config /app/config/default.toml
 
       - name: Push to Docker Hub and GHCR
         run: |
-          VERSION="${{ inputs.version }}"
+          VERSION="${{ steps.ver.outputs.version }}"
           docker tag "fors33/data-bridge:${VERSION}" "ghcr.io/fors33-official/data-bridge:${VERSION}"
           docker push "fors33/data-bridge:${VERSION}"
           docker push "ghcr.io/fors33-official/data-bridge:${VERSION}"
