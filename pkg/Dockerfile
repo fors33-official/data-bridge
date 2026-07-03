@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     build-essential \
     zlib1g-dev \
+    libcurl4-openssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 ARG CARGO_BUILD_FLAGS="--features full_engine"
