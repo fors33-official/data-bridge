@@ -85,8 +85,7 @@ jobs:
           tags: fors33/data-bridge:${{ steps.ver.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          sbom: true
-          provenance: mode=max
+          provenance: false
 
       - name: Validate image config
         run: |
