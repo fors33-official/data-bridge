@@ -22,6 +22,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake pkg-config build-essential zlib1g-dev
+
       - name: Run tests
         run: cargo test --features full_engine
 
